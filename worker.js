@@ -1209,7 +1209,12 @@ function calculateSpanDays(first, last) {
     return 0;
   }
 
-  return Math.max(1, Math.round((last - first) / 86_400_000) + 1);
+  const firstDate = new Date(first);
+  const lastDate = new Date(last);
+  const firstDay = Date.UTC(firstDate.getFullYear(), firstDate.getMonth(), firstDate.getDate());
+  const lastDay = Date.UTC(lastDate.getFullYear(), lastDate.getMonth(), lastDate.getDate());
+
+  return Math.max(1, Math.round((lastDay - firstDay) / 86_400_000) + 1);
 }
 
 function quantile(values, ratio) {
