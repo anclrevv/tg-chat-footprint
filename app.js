@@ -188,7 +188,7 @@ function renderInsights(insights) {
       meta: insights.burstiness.meta,
     },
     {
-      label: "對話黏著度",
+      label: "即時回覆率",
       value: insights.stickiness.label,
       meta: insights.stickiness.meta,
     },
@@ -202,6 +202,12 @@ function renderInsights(insights) {
       value: insights.replyAsymmetry.label,
       meta: insights.replyAsymmetry.meta,
       rows: insights.replyAsymmetry.rows || [],
+    },
+    {
+      label: "誰先開口",
+      value: insights.initiative.label,
+      meta: insights.initiative.meta,
+      rows: insights.initiative.rows || [],
     },
   ];
 

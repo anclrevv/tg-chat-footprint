@@ -18,7 +18,10 @@ const REPLY_BUCKET_LABELS = [
   "6h-1d",
   ">1d",
 ];
-const REPLY_ASYMMETRY_MAX_MS = 30 * 60_000;
+const SESSION_THRESHOLD_FALLBACK_MS = 30 * 60_000;
+const SESSION_THRESHOLD_MIN_MS = 10 * 60_000;
+const SESSION_THRESHOLD_MAX_MS = 24 * 60 * 60_000;
+const QUICK_REPLY_MAX_MS = 60 * 60_000;
 const STOPWORDS = new Set([
   "the",
   "and",
@@ -264,8 +267,8 @@ function createState() {
     monthly: new Map(),
     heatmap: Array.from({ length: 7 }, () => Array(24).fill(0)),
     replyBuckets: Array(REPLY_BUCKET_LABELS.length).fill(0),
-    immediateReplyDelays: [],
-    restartReplyDelays: [],
+    allMessageGaps: [],
+    allTurnDelays: [],
     replySequence: [],
     calls: [],
     lastMessage: null,
@@ -371,19 +374,19 @@ function processMessageObject(message, state) {
   }
 
   if (state.lastMessage) {
+    const gap = timestamp - state.lastMessage.timestamp;
+    if (gap >= 0) {
+      state.allMessageGaps.push(gap);
+    }
+
     if (state.lastMessage.sender !== sender) {
-      const delay = timestamp - state.lastMessage.timestamp;
+      const delay = gap;
       if (delay >= 0) {
         addReplyDelay(state, delay);
-        if (delay < 30 * 60_000) {
-          state.immediateReplyDelays.push(delay);
-        } else {
-          state.restartReplyDelays.push(delay);
-        }
+        state.allTurnDelays.push(delay);
       }
     }
 
-    const gap = timestamp - state.lastMessage.timestamp;
     if (
       gap >= 0 &&
       (!state.longestGap || gap > state.longestGap.duration)
@@ -419,7 +422,19 @@ function resolveSender(message) {
   return "Unknown";
 }
 
-function finalizeState(_state) {}
+function finalizeState(state) {
+  state.sessionThreshold = computeSessionThreshold(state.allMessageGaps);
+  state.quickReplyThreshold = Math.min(state.sessionThreshold, QUICK_REPLY_MAX_MS);
+  state.immediateReplyDelays = state.allTurnDelays.filter((d) => d < state.quickReplyThreshold);
+  state.sessions = buildSessions(state.replySequence, state.sessionThreshold);
+  state.sessionRestartIntervals = [];
+  for (let i = 1; i < state.sessions.length; i += 1) {
+    const gap = state.sessions[i].start - state.sessions[i - 1].end;
+    if (gap >= 0) {
+      state.sessionRestartIntervals.push(gap);
+    }
+  }
+}
 
 function buildPayload(state) {
   const participants = [...state.participants.entries()]
@@ -461,7 +476,9 @@ function buildPayload(state) {
     share: ((participant.messages / totalMessages) * 100).toFixed(1),
   }));
   const immediateReply = quantile(state.immediateReplyDelays, 0.9);
-  const restartReply = quantile(state.restartReplyDelays, 0.5);
+  const restartReply = quantile(state.sessionRestartIntervals, 0.5);
+  const quickLabel = formatThresholdLabel(state.quickReplyThreshold);
+  const sessionLabel = formatThresholdLabel(state.sessionThreshold);
 
   return {
     participants: participants.map((participant) => participant.name),
@@ -485,19 +502,20 @@ function buildPayload(state) {
       balanceMeta: buildBalanceMeta(topParticipants, participants.length),
       immediateReplyLabel: immediateReply === null ? "暫無" : formatDuration(immediateReply),
       immediateReplyMeta: state.immediateReplyDelays.length
-        ? `${state.immediateReplyDelays.length.toLocaleString()} 次 30 分內接話的 p90`
+        ? `${state.immediateReplyDelays.length.toLocaleString()} 次 ${quickLabel}內接話的 p90`
         : "目前還沒有足夠的短間隔回覆",
       restartReplyLabel: restartReply === null ? "暫無" : formatDuration(restartReply),
-      restartReplyMeta: state.restartReplyDelays.length
-        ? `${state.restartReplyDelays.length.toLocaleString()} 次 30 分後重啟的中位數`
+      restartReplyMeta: state.sessionRestartIntervals.length
+        ? `以 ${sessionLabel} 作為對話斷點，${state.sessionRestartIntervals.length.toLocaleString()} 次重啟間隔的中位數`
         : "目前還沒有足夠的重啟對話",
     },
     insights: {
       activeHours: buildActiveHoursInsight(state.heatmap),
       burstiness: buildBurstinessInsight(dailyEntries),
-      stickiness: buildStickinessInsight(state.immediateReplyDelays.length, state.restartReplyDelays.length),
-      restartFrequency: buildRestartFrequencyInsight(state.restartReplyDelays.length, spanDays),
-      replyAsymmetry: buildReplyAsymmetryInsight(state.replySequence),
+      stickiness: buildStickinessInsight(state.immediateReplyDelays.length, state.allTurnDelays.length, state.quickReplyThreshold),
+      restartFrequency: buildRestartFrequencyInsight(Math.max(0, state.sessions.length - 1), spanDays, state.sessionThreshold),
+      replyAsymmetry: buildReplyAsymmetryInsight(state.replySequence, state.quickReplyThreshold),
+      initiative: buildInitiativeInsight(state.sessions),
     },
     timeline: monthlyEntries,
     dailyTimeline: dailyEntries
@@ -562,48 +580,55 @@ function buildBurstinessInsight(dailyEntries) {
     };
   }
 
+  const ratio = peak / Math.max(baseline, 1);
+  const descriptor = ratio <= 2 ? "幾乎固定" : ratio <= 4 ? "一般波動" : "落差明顯";
+
   return {
-    label: `${baseline} / ${peak}`,
-    meta: `一般日 p50 ${baseline.toLocaleString()} 則，聊天很多的日子 p90 ${peak.toLocaleString()} 則`,
+    label: `${descriptor}，差 ${ratio.toFixed(1)} 倍`,
+    meta: `平常日 ${baseline.toLocaleString()} 則，聊開時可達 ${peak.toLocaleString()} 則`,
   };
 }
 
-function buildStickinessInsight(immediateCount, restartCount) {
-  const total = immediateCount + restartCount;
-  if (!total) {
+function buildStickinessInsight(immediateCount, totalTurnSwitches, quickReplyThreshold) {
+  if (!totalTurnSwitches) {
     return {
       label: "暫無",
       meta: "目前還沒有足夠的輪流回覆資料",
     };
   }
 
+  const thresholdLabel = formatThresholdLabel(quickReplyThreshold);
   return {
-    label: `${((immediateCount / total) * 100).toFixed(1)}%`,
-    meta: `${immediateCount.toLocaleString()} / ${total.toLocaleString()} 次輪流回覆是在 30 分鐘內接上`,
+    label: `${((immediateCount / totalTurnSwitches) * 100).toFixed(1)}%`,
+    meta: `${immediateCount.toLocaleString()} / ${totalTurnSwitches.toLocaleString()} 次輪流回覆在 ${thresholdLabel}內接上`,
   };
 }
 
-function buildRestartFrequencyInsight(restartCount, spanDays) {
+function buildRestartFrequencyInsight(restartCount, spanDays, sessionThreshold) {
+  const thresholdLabel = formatThresholdLabel(sessionThreshold);
   if (!restartCount || !spanDays) {
     return {
       label: restartCount ? "偏少" : "暫無",
-      meta: restartCount ? `${restartCount.toLocaleString()} 次 30 分後重啟對話` : "目前還沒有足夠的重啟對話資料",
+      meta: restartCount
+        ? `以 ${thresholdLabel} 作為對話斷點，共 ${restartCount.toLocaleString()} 次重啟`
+        : "目前還沒有足夠的重啟對話資料",
     };
   }
 
   const perWeek = (restartCount / Math.max(spanDays / 7, 1)).toFixed(1);
   return {
     label: `${perWeek} 次/週`,
-    meta: `${restartCount.toLocaleString()} 次 30 分後重啟對話`,
+    meta: `以 ${thresholdLabel} 作為對話斷點，共 ${restartCount.toLocaleString()} 次重啟`,
   };
 }
 
-function buildReplyAsymmetryInsight(replySequence) {
+function buildReplyAsymmetryInsight(replySequence, replyThreshold) {
+  const thresholdLabel = formatThresholdLabel(replyThreshold);
   const participantCount = new Set(replySequence.map((entry) => entry.sender)).size;
   if (participantCount < 2) {
     return {
       label: "暫無",
-      meta: "目前還沒有足夠的雙向回覆資料（只看 30 分鐘內的接話）",
+      meta: `目前還沒有足夠的雙向回覆資料（只看 ${thresholdLabel}內的接話）`,
       rows: [],
     };
   }
@@ -617,7 +642,7 @@ function buildReplyAsymmetryInsight(replySequence) {
         pairDelays.set(key, []);
       }
       const delay = timestamp - previous.timestamp;
-      if (delay >= 0 && delay <= REPLY_ASYMMETRY_MAX_MS) {
+      if (delay >= 0 && delay <= replyThreshold) {
         pairDelays.get(key).push(delay);
       }
     }
@@ -638,8 +663,8 @@ function buildReplyAsymmetryInsight(replySequence) {
     return {
       label: directional[0] ? formatMetricDuration(directional[0].median) : "暫無",
       meta: directional[0]
-        ? `${directional[0].key} 這個方向在 30 分鐘內的常見回覆速度`
-        : "目前還沒有足夠的雙向回覆資料（只看 30 分鐘內的接話）",
+        ? `${directional[0].key} 這個方向在 ${thresholdLabel}內的常見回覆速度`
+        : `目前還沒有足夠的雙向回覆資料（只看 ${thresholdLabel}內的接話）`,
       rows: directional[0]
         ? [
             {
@@ -654,7 +679,7 @@ function buildReplyAsymmetryInsight(replySequence) {
   const difference = Math.abs(directional[0].median - directional[1].median);
   return {
     label: `相差 ${formatMetricDuration(difference)}`,
-    meta: "只看 30 分鐘內的接話，比較雙方平常回得多快",
+    meta: `只看 ${thresholdLabel}內的接話，比較雙方平常回得多快`,
     rows: directional.map((entry) => ({
       label: formatReplyDirectionLabel(entry.key),
       value: formatMetricDuration(entry.median),
@@ -669,6 +694,90 @@ function formatReplyDirectionLabel(directionKey) {
   }
 
   return `${to} 接 ${from}`;
+}
+
+function computeSessionThreshold(gaps) {
+  if (gaps.length < 10) {
+    return SESSION_THRESHOLD_FALLBACK_MS;
+  }
+
+  const p75 = quantile(gaps, 0.75);
+  return Math.max(SESSION_THRESHOLD_MIN_MS, Math.min(SESSION_THRESHOLD_MAX_MS, p75 * 3));
+}
+
+function buildSessions(replySequence, threshold) {
+  if (!replySequence.length) {
+    return [];
+  }
+
+  const sessions = [];
+  let current = {
+    initiator: replySequence[0].sender,
+    start: replySequence[0].timestamp,
+    end: replySequence[0].timestamp,
+    messageCount: 1,
+  };
+
+  for (let i = 1; i < replySequence.length; i += 1) {
+    const gap = replySequence[i].timestamp - replySequence[i - 1].timestamp;
+    if (gap >= threshold) {
+      sessions.push(current);
+      current = {
+        initiator: replySequence[i].sender,
+        start: replySequence[i].timestamp,
+        end: replySequence[i].timestamp,
+        messageCount: 1,
+      };
+    } else {
+      current.end = replySequence[i].timestamp;
+      current.messageCount += 1;
+    }
+  }
+
+  sessions.push(current);
+  return sessions;
+}
+
+function buildInitiativeInsight(sessions) {
+  const restarts = sessions.slice(1);
+  if (restarts.length < 3) {
+    return {
+      label: "暫無",
+      meta: "對話場次太少，還看不出誰比較常先開口",
+      rows: [],
+    };
+  }
+
+  const counts = new Map();
+  for (const session of restarts) {
+    counts.set(session.initiator, (counts.get(session.initiator) || 0) + 1);
+  }
+
+  const sorted = [...counts.entries()].sort((left, right) => right[1] - left[1]);
+  const topName = sorted[0][0];
+  const topCount = sorted[0][1];
+  const share = ((topCount / restarts.length) * 100).toFixed(1);
+
+  return {
+    label: topName,
+    meta: `${restarts.length} 次重啟對話中，${topName} 先開口 ${topCount} 次（${share}%）`,
+    rows: sorted.slice(0, 2).map(([name, count]) => ({
+      label: name,
+      value: `${count} 次（${((count / restarts.length) * 100).toFixed(1)}%）`,
+    })),
+  };
+}
+
+function formatThresholdLabel(ms) {
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 60) {
+    return `${minutes} 分鐘`;
+  }
+  const hours = ms / 3_600_000;
+  if (hours === Math.floor(hours)) {
+    return `${hours} 小時`;
+  }
+  return `${hours.toFixed(1)} 小時`;
 }
 
 function isPhoneCallEvent(message) {
