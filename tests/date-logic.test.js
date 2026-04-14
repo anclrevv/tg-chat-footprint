@@ -277,3 +277,35 @@ assert.equal(context.formatThresholdLabel(90 * 60_000), "1.5 小時");
 assert.equal(context.formatThresholdLabel(24 * 60 * 60_000), "24 小時");
 
 console.log("formatThresholdLabel tests passed");
+
+// --- Large group payload cap tests ---
+
+const largeGroupState = context.createState();
+for (let personIndex = 0; personIndex < 100; personIndex += 1) {
+  const messageCount = 100 - personIndex;
+  for (let messageIndex = 0; messageIndex < messageCount; messageIndex += 1) {
+    context.processMessageObject(
+      {
+        type: "message",
+        date: `2025-12-${String((messageIndex % 28) + 1).padStart(2, "0")}T10:00:00`,
+        from: `Person ${personIndex}`,
+        text: `message ${messageIndex}`,
+      },
+      largeGroupState,
+    );
+  }
+}
+context.finalizeState(largeGroupState);
+const largeGroupPayload = context.buildPayload(largeGroupState);
+
+assert.equal(largeGroupPayload.summary.participantCount, 100);
+assert.equal(largeGroupPayload.participants.length, 9, "charts should use top 8 participants plus Others");
+assert.equal(largeGroupPayload.participants.at(-1), "其他");
+assert.equal(largeGroupPayload.people.length, 80, "people table should be capped for large groups");
+assert.ok(
+  largeGroupPayload.dailyTimeline.some((entry) => entry.byParticipant["其他"] > 0),
+  "daily timeline should aggregate non-top participants into Others",
+);
+assert.equal(largeGroupPayload.messageMix.length, 24, "message mix should be capped to top language participants");
+
+console.log("large group payload cap tests passed");

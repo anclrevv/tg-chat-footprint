@@ -127,6 +127,12 @@ const MESSAGE_TYPE_LABELS = {
   file: "檔案",
   other: "其他",
 };
+const QUANTILE_SAMPLE_LIMIT = 20_000;
+const TIMELINE_PARTICIPANT_LIMIT = 8;
+const PEOPLE_LIMIT = 80;
+const LANGUAGE_PARTICIPANT_LIMIT = 24;
+const LANGUAGE_MIN_MESSAGES = 5;
+const REPLY_ASYMMETRY_PARTICIPANT_LIMIT = 12;
 
 self.addEventListener("message", async ({ data }) => {
   if (data.type !== "analyze") {
@@ -267,9 +273,11 @@ function createState() {
     monthly: new Map(),
     heatmap: Array.from({ length: 7 }, () => Array(24).fill(0)),
     replyBuckets: Array(REPLY_BUCKET_LABELS.length).fill(0),
-    allMessageGaps: [],
-    allTurnDelays: [],
-    replySequence: [],
+    messageGapStats: createQuantileSampler(QUANTILE_SAMPLE_LIMIT),
+    turnDelayStats: createQuantileSampler(QUANTILE_SAMPLE_LIMIT),
+    turnSwitchCount: 0,
+    sequenceSenders: [],
+    sequenceTimestamps: [],
     calls: [],
     lastMessage: null,
     longestGap: null,
@@ -370,20 +378,21 @@ function processMessageObject(message, state) {
 
   if (hasText) {
     updateHeavyTerms(state.heavyTerms, trimmedText);
-    updateParticipantLanguage(state.catchphraseStats, sender, trimmedText);
+    updateParticipantLanguage(state.catchphraseStats, sender, trimmedText, person.messages);
   }
 
   if (state.lastMessage) {
     const gap = timestamp - state.lastMessage.timestamp;
     if (gap >= 0) {
-      state.allMessageGaps.push(gap);
+      addQuantileSample(state.messageGapStats, gap);
     }
 
     if (state.lastMessage.sender !== sender) {
       const delay = gap;
       if (delay >= 0) {
         addReplyDelay(state, delay);
-        state.allTurnDelays.push(delay);
+        addQuantileSample(state.turnDelayStats, delay);
+        state.turnSwitchCount += 1;
       }
     }
 
@@ -400,7 +409,8 @@ function processMessageObject(message, state) {
   }
 
   state.lastMessage = { sender, timestamp };
-  state.replySequence.push({ sender, timestamp });
+  state.sequenceSenders.push(sender);
+  state.sequenceTimestamps.push(timestamp);
 }
 
 function resolveSender(message) {
@@ -423,10 +433,16 @@ function resolveSender(message) {
 }
 
 function finalizeState(state) {
-  state.sessionThreshold = computeSessionThreshold(state.allMessageGaps);
+  state.sessionThreshold = computeSessionThreshold(getQuantileSamples(state.messageGapStats));
   state.quickReplyThreshold = Math.min(state.sessionThreshold, QUICK_REPLY_MAX_MS);
-  state.immediateReplyDelays = state.allTurnDelays.filter((d) => d < state.quickReplyThreshold);
-  state.sessions = buildSessions(state.replySequence, state.sessionThreshold);
+  state.immediateReplyDelays = getQuantileSamples(state.turnDelayStats).filter(
+    (delay) => delay < state.quickReplyThreshold,
+  );
+  state.immediateReplyCount = estimateSampledCount(
+    state.turnDelayStats,
+    state.immediateReplyDelays.length,
+  );
+  state.sessions = buildSessions(state.sequenceSenders, state.sequenceTimestamps, state.sessionThreshold);
   state.sessionRestartIntervals = [];
   for (let i = 1; i < state.sessions.length; i += 1) {
     const gap = state.sessions[i].start - state.sessions[i - 1].end;
@@ -452,11 +468,18 @@ function buildPayload(state) {
       reactionsReceived: buildReactionPayload(stats.reactionsReceived, 4),
     }))
     .sort((left, right) => right.messages - left.messages);
+  const participantCount = participants.length;
+  const timelineParticipants = participants.slice(0, TIMELINE_PARTICIPANT_LIMIT);
+  const timelineParticipantNames = timelineParticipants.map((participant) => participant.name);
+  const timelineNamesWithOther =
+    participantCount > timelineParticipants.length
+      ? [...timelineParticipantNames, "其他"]
+      : timelineParticipantNames;
 
   const dailyEntries = [...state.daily.entries()].map(([date, entry]) => ({
     date,
     total: entry.total,
-    byParticipant: entry.byParticipant,
+    byParticipant: buildGroupedParticipantCounts(entry, timelineParticipantNames),
     weekday: formatWeekday(date),
   }));
 
@@ -465,7 +488,7 @@ function buildPayload(state) {
     .map(([month, entry]) => ({
       label: month,
       total: entry.total,
-      byParticipant: entry.byParticipant,
+      byParticipant: buildGroupedParticipantCounts(entry, timelineParticipantNames),
     }));
 
   const totalMessages = state.totalMessages || 1;
@@ -481,9 +504,11 @@ function buildPayload(state) {
   const sessionLabel = formatThresholdLabel(state.sessionThreshold);
 
   return {
-    participants: participants.map((participant) => participant.name),
+    participants: timelineNamesWithOther,
     summary: {
       totalMessages: state.totalMessages,
+      participantCount,
+      displayedParticipantCount: timelineNamesWithOther.length,
       textMessages: state.textMessages,
       editedMessages: state.editedMessages,
       forwardedMessages: state.forwardedMessages,
@@ -501,8 +526,8 @@ function buildPayload(state) {
       balanceLabel: buildBalanceLabel(topParticipants),
       balanceMeta: buildBalanceMeta(topParticipants, participants.length),
       immediateReplyLabel: immediateReply === null ? "暫無" : formatDuration(immediateReply),
-      immediateReplyMeta: state.immediateReplyDelays.length
-        ? `${state.immediateReplyDelays.length.toLocaleString()} 次 ${quickLabel}內接話的 p90`
+      immediateReplyMeta: state.immediateReplyCount
+        ? `${state.immediateReplyCount.toLocaleString()} 次 ${quickLabel}內接話的 p90`
         : "目前還沒有足夠的短間隔回覆",
       restartReplyLabel: restartReply === null ? "暫無" : formatDuration(restartReply),
       restartReplyMeta: state.sessionRestartIntervals.length
@@ -512,9 +537,14 @@ function buildPayload(state) {
     insights: {
       activeHours: buildActiveHoursInsight(state.heatmap),
       burstiness: buildBurstinessInsight(dailyEntries),
-      stickiness: buildStickinessInsight(state.immediateReplyDelays.length, state.allTurnDelays.length, state.quickReplyThreshold),
+      stickiness: buildStickinessInsight(state.immediateReplyCount, state.turnSwitchCount, state.quickReplyThreshold),
       restartFrequency: buildRestartFrequencyInsight(Math.max(0, state.sessions.length - 1), spanDays, state.sessionThreshold),
-      replyAsymmetry: buildReplyAsymmetryInsight(state.replySequence, state.quickReplyThreshold),
+      replyAsymmetry: buildReplyAsymmetryInsight(
+        state.sequenceSenders,
+        state.sequenceTimestamps,
+        state.quickReplyThreshold,
+        participants.slice(0, REPLY_ASYMMETRY_PARTICIPANT_LIMIT).map((participant) => participant.name),
+      ),
       initiative: buildInitiativeInsight(state.sessions),
     },
     timeline: monthlyEntries,
@@ -544,9 +574,15 @@ function buildPayload(state) {
       .sort((left, right) => right.count - left.count)
       .slice(0, 24),
     catchphrases: buildCatchphrasePayload(state.catchphraseStats, state.totalMessages),
-    messageMix: buildMessageMixPayload(participants, state.participants),
+    messageMix: buildMessageMixPayload(participants.slice(0, LANGUAGE_PARTICIPANT_LIMIT), state.participants),
     calls: buildCallsPayload(state.calls),
-    people: participants,
+    people: participants.slice(0, PEOPLE_LIMIT),
+    participantDisplay: {
+      total: participantCount,
+      timelineLimit: TIMELINE_PARTICIPANT_LIMIT,
+      peopleLimit: PEOPLE_LIMIT,
+      timelineHasOther: participantCount > timelineParticipants.length,
+    },
     topReactions: buildReactionPayload(state.reactionTypes, 10),
   };
 }
@@ -622,38 +658,43 @@ function buildRestartFrequencyInsight(restartCount, spanDays, sessionThreshold) 
   };
 }
 
-function buildReplyAsymmetryInsight(replySequence, replyThreshold) {
+function buildReplyAsymmetryInsight(sequenceSenders, sequenceTimestamps, replyThreshold, participantNames) {
   const thresholdLabel = formatThresholdLabel(replyThreshold);
-  const participantCount = new Set(replySequence.map((entry) => entry.sender)).size;
+  const includedParticipants = new Set(participantNames);
+  const participantCount = includedParticipants.size;
   if (participantCount < 2) {
     return {
       label: "暫無",
-      meta: `目前還沒有足夠的雙向回覆資料（只看 ${thresholdLabel}內的接話）`,
+      meta: `目前還沒有足夠的雙向回覆資料（只看前 ${REPLY_ASYMMETRY_PARTICIPANT_LIMIT} 名、${thresholdLabel}內的接話）`,
       rows: [],
     };
   }
 
   const pairDelays = new Map();
-  let previous = null;
-  for (const { sender, timestamp } of replySequence) {
-    if (previous && previous.sender !== sender) {
-      const key = `${previous.sender}→${sender}`;
+  for (let index = 1; index < sequenceSenders.length; index += 1) {
+    const previousSender = sequenceSenders[index - 1];
+    const sender = sequenceSenders[index];
+    if (
+      previousSender !== sender &&
+      includedParticipants.has(previousSender) &&
+      includedParticipants.has(sender)
+    ) {
+      const key = `${previousSender}→${sender}`;
       if (!pairDelays.has(key)) {
-        pairDelays.set(key, []);
+        pairDelays.set(key, createQuantileSampler(QUANTILE_SAMPLE_LIMIT));
       }
-      const delay = timestamp - previous.timestamp;
+      const delay = sequenceTimestamps[index] - sequenceTimestamps[index - 1];
       if (delay >= 0 && delay <= replyThreshold) {
-        pairDelays.get(key).push(delay);
+        addQuantileSample(pairDelays.get(key), delay);
       }
     }
-    previous = { sender, timestamp };
   }
 
   const directional = [...pairDelays.entries()]
-    .map(([key, delays]) => ({
+    .map(([key, stats]) => ({
       key,
-      count: delays.length,
-      median: quantile(delays, 0.5),
+      count: stats.seen,
+      median: quantile(getQuantileSamples(stats), 0.5),
     }))
     .filter((entry) => entry.median !== null)
     .sort((left, right) => right.count - left.count)
@@ -664,7 +705,7 @@ function buildReplyAsymmetryInsight(replySequence, replyThreshold) {
       label: directional[0] ? formatMetricDuration(directional[0].median) : "暫無",
       meta: directional[0]
         ? `${directional[0].key} 這個方向在 ${thresholdLabel}內的常見回覆速度`
-        : `目前還沒有足夠的雙向回覆資料（只看 ${thresholdLabel}內的接話）`,
+        : `目前還沒有足夠的雙向回覆資料（只看前 ${REPLY_ASYMMETRY_PARTICIPANT_LIMIT} 名、${thresholdLabel}內的接話）`,
       rows: directional[0]
         ? [
             {
@@ -679,7 +720,7 @@ function buildReplyAsymmetryInsight(replySequence, replyThreshold) {
   const difference = Math.abs(directional[0].median - directional[1].median);
   return {
     label: `相差 ${formatMetricDuration(difference)}`,
-    meta: `只看 ${thresholdLabel}內的接話，比較雙方平常回得多快`,
+    meta: `只看前 ${REPLY_ASYMMETRY_PARTICIPANT_LIMIT} 名、${thresholdLabel}內的接話，比較雙方平常回得多快`,
     rows: directional.map((entry) => ({
       label: formatReplyDirectionLabel(entry.key),
       value: formatMetricDuration(entry.median),
@@ -705,31 +746,68 @@ function computeSessionThreshold(gaps) {
   return Math.max(SESSION_THRESHOLD_MIN_MS, Math.min(SESSION_THRESHOLD_MAX_MS, p75 * 3));
 }
 
-function buildSessions(replySequence, threshold) {
-  if (!replySequence.length) {
+function createQuantileSampler(limit) {
+  return {
+    limit,
+    seen: 0,
+    values: [],
+  };
+}
+
+function addQuantileSample(stats, value) {
+  if (!Number.isFinite(value)) {
+    return;
+  }
+
+  stats.seen += 1;
+  if (stats.values.length < stats.limit) {
+    stats.values.push(value);
+    return;
+  }
+
+  const index = (stats.seen * 48_271) % stats.limit;
+  stats.values[index] = value;
+}
+
+function getQuantileSamples(stats) {
+  return stats.values;
+}
+
+function estimateSampledCount(stats, sampleCount) {
+  if (!stats.values.length || !sampleCount) {
+    return 0;
+  }
+  if (stats.values.length === stats.seen) {
+    return sampleCount;
+  }
+  return Math.round((sampleCount / stats.values.length) * stats.seen);
+}
+
+function buildSessions(sequenceSenders, sequenceTimestamps, threshold) {
+  if (!sequenceSenders.length) {
     return [];
   }
 
   const sessions = [];
   let current = {
-    initiator: replySequence[0].sender,
-    start: replySequence[0].timestamp,
-    end: replySequence[0].timestamp,
+    initiator: sequenceSenders[0],
+    start: sequenceTimestamps[0],
+    end: sequenceTimestamps[0],
     messageCount: 1,
   };
 
-  for (let i = 1; i < replySequence.length; i += 1) {
-    const gap = replySequence[i].timestamp - replySequence[i - 1].timestamp;
+  for (let i = 1; i < sequenceSenders.length; i += 1) {
+    const gap = sequenceTimestamps[i] - sequenceTimestamps[i - 1];
     if (gap >= threshold) {
       sessions.push(current);
       current = {
-        initiator: replySequence[i].sender,
-        start: replySequence[i].timestamp,
-        end: replySequence[i].timestamp,
+        initiator: sequenceSenders[i],
+        start: sequenceTimestamps[i],
+        end: sequenceTimestamps[i],
         messageCount: 1,
       };
     } else {
-      current.end = replySequence[i].timestamp;
+      current.end = sequenceTimestamps[i];
       current.messageCount += 1;
     }
   }
@@ -941,6 +1019,26 @@ function getOrCreateBucket(map, key) {
   return entry;
 }
 
+function buildGroupedParticipantCounts(entry, selectedNames) {
+  const grouped = {};
+  let selectedTotal = 0;
+
+  for (const name of selectedNames) {
+    const count = entry.byParticipant[name] || 0;
+    if (count > 0) {
+      grouped[name] = count;
+      selectedTotal += count;
+    }
+  }
+
+  const other = entry.total - selectedTotal;
+  if (other > 0) {
+    grouped["其他"] = other;
+  }
+
+  return grouped;
+}
+
 function addReplyDelay(state, delay) {
   const bucketIndex = REPLY_BUCKETS_MS.findIndex((limit) => delay < limit);
   const safeIndex = bucketIndex === -1 ? state.replyBuckets.length - 1 : bucketIndex;
@@ -954,13 +1052,30 @@ function updateHeavyTerms(heavyTerms, text) {
   }
 }
 
-function updateParticipantLanguage(catchphraseStats, sender, text) {
+function updateParticipantLanguage(catchphraseStats, sender, text, senderMessageCount) {
   let person = catchphraseStats.get(sender);
   if (!person) {
+    if (senderMessageCount < LANGUAGE_MIN_MESSAGES) {
+      return;
+    }
+    if (catchphraseStats.size >= LANGUAGE_PARTICIPANT_LIMIT) {
+      let smallestName = null;
+      let smallestMessages = Infinity;
+      for (const [name, stats] of catchphraseStats.entries()) {
+        if (stats.messages < smallestMessages) {
+          smallestName = name;
+          smallestMessages = stats.messages;
+        }
+      }
+      if (senderMessageCount <= smallestMessages) {
+        return;
+      }
+      catchphraseStats.delete(smallestName);
+    }
     person = {
       words: new Map(),
       phrases: new Map(),
-      messages: 0,
+      messages: senderMessageCount - 1,
     };
     catchphraseStats.set(sender, person);
   }
@@ -1362,7 +1477,7 @@ function buildBalanceMeta(topParticipants, participantCount) {
     return names;
   }
 
-  return `${names}（取前兩位）`;
+  return `${names}（共 ${participantCount.toLocaleString()} 位，取前兩位）`;
 }
 
 function formatDuration(ms) {

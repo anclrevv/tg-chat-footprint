@@ -172,7 +172,7 @@ function renderDashboard(payload) {
   renderCalls(payload.calls);
   renderSignals(payload.summary);
   renderTopReactions(payload.topReactions, payload.summary.totalReactionCount);
-  renderPeople(payload.people);
+  renderPeople(payload.people, payload.participantDisplay);
 }
 
 function renderInsights(insights) {
@@ -744,14 +744,19 @@ function renderTopReactions(topReactions, totalReactionCount) {
   bindTooltips(reactionsPanel);
 }
 
-function renderPeople(people) {
+function renderPeople(people, participantDisplay) {
   if (!people.length) {
     peopleTable.innerHTML = `<div class="empty-state">目前還沒有參與者統計資料。</div>`;
     return;
   }
 
   const maxMessages = Math.max(...people.map((person) => person.messages), 1);
+  const limitNotice =
+    participantDisplay && participantDisplay.total > people.length
+      ? `<div class="table-note">大型群組模式：以下顯示訊息數前 ${people.length.toLocaleString()} 位，全部共有 ${participantDisplay.total.toLocaleString()} 位參與者。</div>`
+      : "";
   peopleTable.innerHTML = [
+    limitNotice,
     `<div class="table-row table-row-wide header"><div>參與者</div><div>訊息數</div><div>平均字數</div><div>媒體訊息占比</div><div>互動線索</div></div>`,
     ...people.map((person) => {
       const share = ((person.messages / maxMessages) * 100).toFixed(1);
