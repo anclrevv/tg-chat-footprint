@@ -19,6 +19,7 @@ export default {
     headers.set("X-Content-Type-Options", "nosniff");
     headers.set("Referrer-Policy", "no-referrer");
     headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()");
+    headers.set("Cache-Control", appendCacheDirective(headers.get("Cache-Control"), "no-transform"));
 
     return new Response(response.body, {
       status: response.status,
@@ -27,3 +28,10 @@ export default {
     });
   },
 };
+
+function appendCacheDirective(value, directive) {
+  if (!value) {
+    return directive;
+  }
+  return value.toLowerCase().includes(directive) ? value : `${value}, ${directive}`;
+}
