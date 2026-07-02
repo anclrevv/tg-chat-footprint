@@ -1,5 +1,5 @@
 {
-  "name": "telegram-chat-lens",
+  "name": "tg-chat-footprint",
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
