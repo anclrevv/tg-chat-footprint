@@ -9,6 +9,8 @@ Thumbs.db
 
 # Local preview / logs
 *.log
+coverage/
+dist/
 
 # Python local server / caches
 __pycache__/
@@ -18,11 +20,16 @@ __pycache__/
 node_modules/
 .wrangler/
 .dev.vars
+.env
+.env.*
+!.env.example
 
 # Telegram export data
 result.json
+demo.json
 exports/
 telegram-export/
+telegram-export-*/
 tmp/
 json/*.json
 

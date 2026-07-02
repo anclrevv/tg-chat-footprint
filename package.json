@@ -1,10 +1,13 @@
 {
   "name": "tg-chat-footprint",
+  "version": "0.1.0",
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "check": "wrangler deploy --dry-run"
+    "check": "wrangler deploy --dry-run",
+    "test": "node tests/date-logic.test.js",
+    "verify": "npm run test && npm run check"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

@@ -309,3 +309,70 @@ assert.ok(
 assert.equal(largeGroupPayload.messageMix.length, 24, "message mix should be capped to top language participants");
 
 console.log("large group payload cap tests passed");
+
+// --- Message type, reaction, calls, rich text, and injection-shaped text tests ---
+
+const mixedState = context.createState();
+context.processMessageObject(
+  {
+    type: "message",
+    date: "2025-12-24T10:00:00",
+    from: "A",
+    text: [
+      "hello ",
+      { type: "bold", text: "<script>alert(1)</script>" },
+      { type: "link", text: "example", href: "javascript:alert(1)" },
+    ],
+    text_entities: [{ type: "text_link" }],
+    reactions: [
+      { type: "emoji", emoji: "👍", count: 2 },
+      { type: "custom_emoji", document_id: "abc", count: 1 },
+    ],
+  },
+  mixedState,
+);
+context.processMessageObject(
+  {
+    type: "message",
+    date: "2025-12-24T10:01:00",
+    from: "B",
+    text: "",
+    sticker_emoji: "🙂",
+    media_type: "sticker",
+  },
+  mixedState,
+);
+context.processMessageObject(
+  {
+    type: "service",
+    action: "phone_call",
+    date: "2025-12-24T10:05:00",
+    actor: "A",
+    duration_seconds: 125,
+    discard_reason: "hangup",
+  },
+  mixedState,
+);
+
+context.finalizeState(mixedState);
+const mixedPayload = context.buildPayload(mixedState);
+
+assert.equal(mixedPayload.summary.totalMessages, 2, "phone calls should not inflate message count");
+assert.equal(mixedPayload.summary.linkedMessages, 1, "text_link entities should count as linked messages");
+assert.equal(mixedPayload.summary.reactedMessages, 1, "message with reactions should be counted once");
+assert.equal(mixedPayload.summary.totalReactionCount, 3, "reaction counts should be summed");
+assert.equal(mixedPayload.topReactions[0].count, 2, "emoji reactions should be reported");
+assert.equal(mixedPayload.calls.total, 1, "phone_call service event should be reported");
+assert.equal(mixedPayload.calls.connected, 1, "positive duration calls should count as connected");
+assert.ok(
+  mixedPayload.messageMix.some((person) =>
+    person.categories.some((category) => category.label === "貼圖" && category.count === 1),
+  ),
+  "sticker messages should be classified",
+);
+assert.ok(
+  mixedPayload.topTerms.some((entry) => entry.term.includes("script") || entry.term.includes("alert")),
+  "rich text array should be extracted as text for aggregation, not executed",
+);
+
+console.log("message type + reaction + call tests passed");

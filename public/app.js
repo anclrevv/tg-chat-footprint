@@ -1,13 +1,17 @@
-const worker = new Worker("./worker.js", { type: "module" });
-
 const fileInput = document.querySelector("#file-input");
 const dropzone = document.querySelector("#dropzone");
-const demoButton = document.querySelector("#demo-button");
 const dashboard = document.querySelector("#dashboard");
+const dashboardEmpty = document.querySelector("#dashboard-empty");
 const statusText = document.querySelector("#status-text");
 const progressFill = document.querySelector("#progress-fill");
 const progressText = document.querySelector("#progress-text");
 const fileMeta = document.querySelector("#file-meta");
+const fileName = document.querySelector("#file-name");
+const fileSize = document.querySelector("#file-size");
+const conversationSummary = document.querySelector("#conversation-summary");
+const clearAnalysisButton = document.querySelector("#clear-analysis");
+const reselectFileButton = document.querySelector("#reselect-file");
+const analysisLive = document.querySelector("#analysis-live");
 const summaryGrid = document.querySelector("#summary-grid");
 const insightsGrid = document.querySelector("#insights-grid");
 const timelineChart = document.querySelector("#timeline-chart");
@@ -27,23 +31,30 @@ const summaryCardTemplate = document.querySelector("#summary-card-template");
 const replyInfoButton = document.querySelector("#reply-info-button");
 const replyInfo = document.querySelector("#reply-info");
 const chartTooltip = document.querySelector("#chart-tooltip");
-const guidePanel = document.querySelector("#guide-panel");
-const guideToggle = document.querySelector("#guide-toggle");
-const guideContent = document.querySelector("#guide-content");
+const sidebar = document.querySelector("#sidebar");
+const sidebarOverlay = document.querySelector("#sidebar-overlay");
+const navToggle = document.querySelector("#nav-toggle");
+const navLinks = [...document.querySelectorAll("[data-section-link]")];
+const guideDialog = document.querySelector("#guide-dialog");
+const guideOpenButtons = [document.querySelector("#guide-open"), document.querySelector("#guide-open-secondary")].filter(Boolean);
+const guideCloseButton = document.querySelector("#guide-close");
+const guideJump = document.querySelector("#guide-jump");
 
 let currentFile = null;
 let dailyTimelineState = null;
+let analysisWorker = null;
+let isAnalyzing = false;
+let lastDialogTrigger = null;
+let currentPayload = null;
+const PARTICIPANT_COLORS = ["#14b8a6", "#3b82f6", "#8b5cf6", "#f59e0b", "#22c55e", "#ef4444", "#06b6d4", "#64748b", "#94a3b8"];
+
+initializeNavigation();
+initializeGuideDialog();
+resetUiState();
 
 replyInfoButton.addEventListener("click", () => {
   const isHidden = replyInfo.classList.toggle("hidden");
   replyInfoButton.setAttribute("aria-expanded", String(!isHidden));
-});
-
-guideToggle.addEventListener("click", () => {
-  const isCollapsed = guideContent.classList.toggle("hidden");
-  guidePanel.classList.toggle("is-collapsed", isCollapsed);
-  guideToggle.setAttribute("aria-expanded", String(!isCollapsed));
-  guideToggle.textContent = isCollapsed ? "看匯出教學" : "先收起教學";
 });
 
 fileInput.addEventListener("change", (event) => {
@@ -53,34 +64,10 @@ fileInput.addEventListener("change", (event) => {
   }
 });
 
-demoButton.addEventListener("click", async () => {
-  if (demoButton.disabled) {
-    return;
-  }
-
-  demoButton.disabled = true;
-  statusText.textContent = "正在載入示範資料";
-  fileMeta.textContent = "正在讀取匿名化 demo.json";
-  setProgress(0);
-
-  try {
-    const response = await fetch("./demo.json");
-    if (!response.ok) {
-      throw new Error(`demo.json 載入失敗 (${response.status})`);
-    }
-
-    const blob = await response.blob();
-    const file = new File([blob], "demo.json", {
-      type: blob.type || "application/json",
-      lastModified: Date.now(),
-    });
-
-    handleFile(file);
-  } catch (error) {
-    statusText.textContent = "示範資料暫時無法載入";
-    fileMeta.textContent = error instanceof Error ? error.message : "目前無法讀取 demo.json，請稍後再試。";
-  } finally {
-    demoButton.disabled = false;
+dropzone.addEventListener("keydown", (event) => {
+  if ((event.key === "Enter" || event.key === " ") && !isAnalyzing) {
+    event.preventDefault();
+    fileInput.click();
   }
 });
 
@@ -105,55 +92,74 @@ demoButton.addEventListener("click", async () => {
   });
 });
 
-worker.addEventListener("message", ({ data }) => {
+clearAnalysisButton.addEventListener("click", clearAnalysis);
+reselectFileButton.addEventListener("click", () => {
+  fileInput.click();
+});
+
+function createAnalysisWorker() {
+  const worker = new Worker("./worker.js", { type: "module" });
+  worker.addEventListener("message", handleWorkerMessage);
+  worker.addEventListener("error", () => {
+    showError("瀏覽器背景分析程序啟動失敗，請重新整理頁面後再試一次。");
+  });
+  return worker;
+}
+
+function handleWorkerMessage({ data }) {
   if (data.type === "progress") {
     statusText.textContent = data.label;
     setProgress(data.progress);
     if (currentFile) {
-      fileMeta.textContent = `${currentFile.name} • ${formatBytes(currentFile.size)} • 已處理 ${data.processedMessages.toLocaleString()} 則訊息`;
+      fileMeta.textContent = `已處理 ${data.processedMessages.toLocaleString()} 則訊息`;
     }
     return;
   }
 
   if (data.type === "result") {
+    isAnalyzing = false;
+    setInputDisabled(false);
     setProgress(100);
     statusText.textContent = "分析完成，可以開始看內容了";
     renderDashboard(data.payload);
     dashboard.classList.remove("hidden");
-    collapseGuide();
+    dashboardEmpty.classList.add("hidden");
+    analysisLive.textContent = "分析完成，結果已更新。";
     scrollDashboardIntoView();
     return;
   }
 
   if (data.type === "error") {
-    statusText.textContent = "這份檔案目前無法讀取";
-    fileMeta.textContent = data.message;
+    showError(data.message || "這份檔案目前無法讀取，請確認是否為 Telegram 匯出的 result.json。");
   }
-});
+}
 
 function handleFile(file) {
+  if (isAnalyzing) {
+    return;
+  }
+
+  if (!isLikelyJsonFile(file)) {
+    showError("請選擇 Telegram 匯出的 JSON 檔案，通常檔名是 result.json。");
+    return;
+  }
+
+  terminateWorker();
+  analysisWorker = createAnalysisWorker();
+  isAnalyzing = true;
   currentFile = file;
+  clearRenderedResults();
   dashboard.classList.add("hidden");
-  dailyTimelineState = null;
-  summaryGrid.innerHTML = "";
-  insightsGrid.innerHTML = "";
-  timelineChart.innerHTML = "";
-  dailyTimelineControls.innerHTML = "";
-  dailyTimelineChart.innerHTML = "";
-  heatmapChart.innerHTML = "";
-  replyChart.innerHTML = "";
-  daysTable.innerHTML = "";
-  termsCloud.innerHTML = "";
-  phrasesPanel.innerHTML = "";
-  messageMixPanel.innerHTML = "";
-  callsPanel.innerHTML = "";
-  signalsPanel.innerHTML = "";
-  reactionsPanel.innerHTML = "";
-  peopleTable.innerHTML = "";
+  dashboardEmpty.classList.remove("hidden");
+  statusText.classList.remove("status-error");
+  setInputDisabled(true);
   setProgress(0);
   statusText.textContent = "已收到檔案，開始整理中";
-  fileMeta.textContent = `${file.name} • ${formatBytes(file.size)}`;
-  worker.postMessage({ type: "analyze", file });
+  fileName.textContent = file.name;
+  fileSize.textContent = formatBytes(file.size);
+  fileMeta.textContent = "背景分析中，請保持此頁開啟。";
+  analysisLive.textContent = "已開始分析檔案。";
+  analysisWorker.postMessage({ type: "analyze", file });
 }
 
 function setProgress(value) {
@@ -163,6 +169,8 @@ function setProgress(value) {
 }
 
 function renderDashboard(payload) {
+  currentPayload = payload;
+  renderDatasetStrip(payload);
   renderSummary(payload.summary);
   renderInsights(payload.insights);
   renderTimeline(payload.timeline, payload.participants);
@@ -177,6 +185,14 @@ function renderDashboard(payload) {
   renderSignals(payload.summary);
   renderTopReactions(payload.topReactions, payload.summary.totalReactionCount);
   renderPeople(payload.people, payload.participantDisplay);
+}
+
+function renderDatasetStrip(payload) {
+  const { summary } = payload;
+  const firstDate = getFirstTimelineDate(payload);
+  const lastDate = getLastTimelineDate(payload);
+  const fileLabel = currentFile ? currentFile.name : "Telegram 對話";
+  conversationSummary.textContent = `${fileLabel} • ${summary.totalMessages.toLocaleString()} 則訊息 • ${summary.participantCount.toLocaleString()} 位參與者 • ${firstDate} 到 ${lastDate}`;
 }
 
 function renderInsights(insights) {
@@ -253,40 +269,255 @@ function collapseGuide() {
 
 function scrollDashboardIntoView() {
   dashboard.scrollIntoView({
-    behavior: "smooth",
+    behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
     block: "start",
   });
 }
 
+function initializeNavigation() {
+  navToggle.addEventListener("click", () => {
+    const shouldOpen = !sidebar.classList.contains("is-open");
+    setDrawerOpen(shouldOpen);
+  });
+
+  sidebarOverlay.addEventListener("click", () => setDrawerOpen(false));
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      setDrawerOpen(false);
+    }
+  });
+
+  for (const link of navLinks) {
+    link.addEventListener("click", () => setDrawerOpen(false));
+  }
+
+  const observedSections = [...document.querySelectorAll("[data-section]")];
+  const observer = new IntersectionObserver(
+    (entries) => {
+      const visible = entries
+        .filter((entry) => entry.isIntersecting)
+        .sort((left, right) => right.intersectionRatio - left.intersectionRatio)[0];
+      if (!visible) {
+        return;
+      }
+      setActiveSection(visible.target.id);
+    },
+    {
+      rootMargin: "-20% 0px -65% 0px",
+      threshold: [0.1, 0.3, 0.6],
+    },
+  );
+
+  for (const section of observedSections) {
+    observer.observe(section);
+  }
+}
+
+function initializeGuideDialog() {
+  for (const button of guideOpenButtons) {
+    button.addEventListener("click", () => openGuideDialog(button));
+  }
+  guideCloseButton.addEventListener("click", closeGuideDialog);
+  guideJump.addEventListener("click", closeGuideDialog);
+  guideDialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeGuideDialog();
+  });
+  guideDialog.addEventListener("keydown", trapDialogFocus);
+}
+
+function openGuideDialog(trigger) {
+  lastDialogTrigger = trigger;
+  if (typeof guideDialog.showModal === "function") {
+    guideDialog.showModal();
+    guideCloseButton.focus();
+  } else {
+    document.querySelector("#usage-guide").scrollIntoView({ behavior: "smooth" });
+  }
+}
+
+function closeGuideDialog() {
+  if (guideDialog.open) {
+    guideDialog.close();
+  }
+  lastDialogTrigger?.focus();
+}
+
+function trapDialogFocus(event) {
+  if (event.key !== "Tab") {
+    return;
+  }
+  const focusable = [
+    ...guideDialog.querySelectorAll("a[href], button:not(:disabled), [tabindex]:not([tabindex='-1'])"),
+  ].filter((element) => element.offsetParent !== null);
+  if (!focusable.length) {
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+function setDrawerOpen(isOpen) {
+  sidebar.classList.toggle("is-open", isOpen);
+  sidebarOverlay.classList.toggle("hidden", !isOpen);
+  document.body.classList.toggle("drawer-open", isOpen);
+  navToggle.setAttribute("aria-expanded", String(isOpen));
+  navToggle.setAttribute("aria-label", isOpen ? "關閉導覽" : "開啟導覽");
+}
+
+function setActiveSection(sectionId) {
+  for (const link of navLinks) {
+    link.classList.toggle("active", link.dataset.sectionLink === sectionId);
+  }
+}
+
+function clearRenderedResults() {
+  dailyTimelineState = null;
+  currentPayload = null;
+  summaryGrid.innerHTML = "";
+  insightsGrid.innerHTML = "";
+  timelineChart.innerHTML = "";
+  dailyTimelineControls.innerHTML = "";
+  dailyTimelineChart.innerHTML = "";
+  heatmapChart.innerHTML = "";
+  replyChart.innerHTML = "";
+  daysTable.innerHTML = "";
+  termsCloud.innerHTML = "";
+  phrasesPanel.innerHTML = "";
+  messageMixPanel.innerHTML = "";
+  callsPanel.innerHTML = "";
+  signalsPanel.innerHTML = "";
+  reactionsPanel.innerHTML = "";
+  peopleTable.innerHTML = "";
+}
+
+function clearAnalysis() {
+  terminateWorker();
+  currentFile = null;
+  fileInput.value = "";
+  clearRenderedResults();
+  resetUiState();
+  analysisLive.textContent = "分析結果已清除。";
+}
+
+function resetUiState() {
+  isAnalyzing = false;
+  setInputDisabled(false);
+  dashboard.classList.add("hidden");
+  dashboardEmpty.classList.remove("hidden");
+  statusText.classList.remove("status-error");
+  statusText.textContent = "準備好了，等您載入聊天檔案";
+  fileName.textContent = "尚未選擇檔案";
+  fileSize.textContent = "—";
+  fileMeta.textContent = "";
+  conversationSummary.textContent = "已完成本機分析。";
+  setProgress(0);
+}
+
+function terminateWorker() {
+  if (!analysisWorker) {
+    return;
+  }
+  analysisWorker.terminate();
+  analysisWorker = null;
+}
+
+function setInputDisabled(disabled) {
+  fileInput.disabled = disabled;
+  dropzone.classList.toggle("is-disabled", disabled);
+  clearAnalysisButton.disabled = false;
+  reselectFileButton.disabled = disabled;
+}
+
+function showError(message) {
+  isAnalyzing = false;
+  setInputDisabled(false);
+  terminateWorker();
+  statusText.textContent = message;
+  statusText.classList.add("status-error");
+  fileMeta.textContent = "請清除後重新匯入，或確認檔案是否為 Telegram Desktop 匯出的 result.json。";
+  analysisLive.textContent = `分析失敗：${message}`;
+}
+
+function isLikelyJsonFile(file) {
+  return (
+    file.type === "application/json" ||
+    file.name.toLowerCase().endsWith(".json") ||
+    file.name.toLowerCase() === "result"
+  );
+}
+
+function getFirstTimelineDate(payload = currentPayload) {
+  return payload?.dailyTimeline?.[0]?.label || "—";
+}
+
+function getLastTimelineDate(payload = currentPayload) {
+  const entries = payload?.dailyTimeline || [];
+  return entries.length ? entries[entries.length - 1].label : "—";
+}
+
 function renderSummary(summary) {
   summaryGrid.innerHTML = "";
+  const firstDate = getFirstTimelineDate();
+  const lastDate = getLastTimelineDate();
   const cards = [
     {
+      icon: "💬",
       label: "總訊息數",
       value: formatCompact(summary.totalMessages),
       meta: `${summary.textMessages.toLocaleString()} 則含文字內容`,
     },
     {
+      icon: "📅",
+      label: "活躍日數",
+      value: summary.activeDays ? summary.activeDays.toLocaleString() : "—",
+      meta: `${summary.participantCount.toLocaleString()} 位參與者`,
+    },
+    {
+      icon: "▶",
+      label: "開始日期",
+      value: firstDate,
+      meta: "最早的對話記錄",
+    },
+    {
+      icon: "◼",
+      label: "最後日期",
+      value: lastDate,
+      meta: "最近的對話記錄",
+    },
+    {
+      icon: "↔",
       label: "時間跨度",
       value: summary.rangeLabel,
       meta: `${summary.activeDays.toLocaleString()} 個活躍日`,
     },
     {
+      icon: "▦",
       label: "活躍密度",
       value: summary.activeDensityLabel,
       meta: summary.activeDensityMeta,
     },
     {
+      icon: "⚖",
       label: "發話平衡",
       value: summary.balanceLabel,
       meta: summary.balanceMeta,
     },
     {
+      icon: "⏱",
       label: "即時回覆節奏",
       value: summary.immediateReplyLabel,
       meta: summary.immediateReplyMeta,
     },
     {
+      icon: "↺",
       label: "重啟對話間隔",
       value: summary.restartReplyLabel,
       meta: summary.restartReplyMeta,
@@ -295,8 +526,9 @@ function renderSummary(summary) {
 
   for (const card of cards) {
     const fragment = summaryCardTemplate.content.cloneNode(true);
+    fragment.querySelector(".summary-icon").dataset.icon = card.icon;
     fragment.querySelector(".summary-label").textContent = card.label;
-    fragment.querySelector(".summary-value").textContent = card.value;
+    fragment.querySelector(".summary-value").textContent = safeDisplay(card.value);
     fragment.querySelector(".summary-meta").textContent = card.meta;
     summaryGrid.appendChild(fragment);
   }
@@ -316,7 +548,7 @@ function renderTimeline(timeline, participants) {
   const maxTotal = Math.max(...timeline.map((entry) => entry.total), 1);
   const barWidth = innerWidth / timeline.length;
   const labelStep = Math.max(1, Math.ceil(timeline.length / 12));
-  const colors = ["#1f7a5c", "#c46d2d", "#325c8a", "#874f96"];
+  const colors = PARTICIPANT_COLORS;
 
   const stackedBars = timeline
     .map((entry, index) => {
@@ -343,7 +575,7 @@ function renderTimeline(timeline, participants) {
     .map((ratio) => {
       const y = padding.top + innerHeight - innerHeight * ratio;
       const value = Math.round(maxTotal * ratio);
-      return `<g><line x1="${padding.left}" y1="${y}" x2="${width - padding.right}" y2="${y}" stroke="rgba(80,62,42,0.12)" /><text class="axis-text" x="${padding.left - 8}" y="${y + 4}" text-anchor="end">${value}</text></g>`;
+      return `<g><line x1="${padding.left}" y1="${y}" x2="${width - padding.right}" y2="${y}" stroke="#e7ecf2" /><text class="axis-text" x="${padding.left - 8}" y="${y + 4}" text-anchor="end">${value}</text></g>`;
     })
     .join("");
 
@@ -374,7 +606,7 @@ function renderHeatmap(heatmap) {
         const y = padding.top + dayIndex * cellHeight;
         const alpha = value === 0 ? 0.08 : 0.16 + 0.84 * (value / maxValue);
         const tooltip = `週${days[dayIndex]} ${String(hour).padStart(2, "0")}:00-${String((hour + 1) % 24).padStart(2, "0")}:00\n${value.toLocaleString()} 則訊息`;
-        return `<rect class="has-tooltip" data-tooltip="${escapeAttribute(tooltip)}" x="${x + 1}" y="${y + 1}" width="${cellWidth - 2}" height="${cellHeight - 2}" rx="6" fill="rgba(31,122,92,${alpha})"></rect>`;
+        return `<rect class="has-tooltip" data-tooltip="${escapeAttribute(tooltip)}" x="${x + 1}" y="${y + 1}" width="${cellWidth - 2}" height="${cellHeight - 2}" rx="6" fill="rgba(20,184,166,${alpha})"></rect>`;
       }),
     )
     .join("");
@@ -466,13 +698,13 @@ function renderDailyTimelineChart() {
   const maxTotal = Math.max(...timeline.map((entry) => entry.total), 1);
   const stepX = timeline.length > 1 ? innerWidth / (timeline.length - 1) : innerWidth;
   const labelStep = Math.max(1, Math.ceil(timeline.length / 8));
-  const colors = ["#1f7a5c", "#c46d2d", "#325c8a", "#874f96"];
+  const colors = PARTICIPANT_COLORS;
 
   const yLines = [0, 0.5, 1]
     .map((ratio) => {
       const y = padding.top + innerHeight - innerHeight * ratio;
       const label = Math.round(maxTotal * ratio);
-      return `<g><line x1="${padding.left}" y1="${y}" x2="${width - padding.right}" y2="${y}" stroke="rgba(80,62,42,0.12)" /><text class="axis-text" x="${padding.left - 8}" y="${y + 4}" text-anchor="end">${label}</text></g>`;
+      return `<g><line x1="${padding.left}" y1="${y}" x2="${width - padding.right}" y2="${y}" stroke="#e7ecf2" /><text class="axis-text" x="${padding.left - 8}" y="${y + 4}" text-anchor="end">${label}</text></g>`;
     })
     .join("");
 
@@ -1003,8 +1235,16 @@ function formatShare(part, total) {
   return `${((part / total) * 100).toFixed(1)}%`;
 }
 
+function safeDisplay(value) {
+  if (value === null || value === undefined || value === "") {
+    return "—";
+  }
+  const stringValue = String(value);
+  return /NaN|Infinity/.test(stringValue) ? "—" : stringValue;
+}
+
 function escapeHtml(input) {
-  return input
+  return String(input)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");

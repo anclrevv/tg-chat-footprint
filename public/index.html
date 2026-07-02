@@ -3,286 +3,419 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Telegram Chat Lens</title>
-    <meta
-      name="description"
-      content="直接在瀏覽器分析 Telegram 對話匯出 JSON，不用一次載入整份聊天紀錄。"
-    />
+    <meta name="description" content="在瀏覽器本機分析 Telegram 對話紀錄，探索訊息趨勢、回覆節奏、互動模式與常用詞彙。" />
+    <meta name="theme-color" content="#06233f" />
+    <meta name="color-scheme" content="light" />
+    <meta name="robots" content="index,follow" />
+    <meta property="og:title" content="TG Chat Footprint｜對話足跡分析" />
+    <meta property="og:description" content="隱私優先的 Telegram 對話分析工具，所有聊天資料都只在使用者瀏覽器內解析與視覺化。" />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary" />
+    <title>TG Chat Footprint｜對話足跡分析</title>
+    <link rel="icon" href="./img/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <main class="app-shell">
-      <section class="hero">
-        <p class="eyebrow">Cloudflare Workers Ready</p>
-        <h1>Telegram Chat Lens</h1>
-        <p class="hero-copy">
-          把 Telegram 匯出的 <code>result.json</code> 拖進來，就能直接在瀏覽器裡看到這段對話的節奏、活躍時段和互動樣貌。
-          所有分析都在你的電腦上完成，不需要上傳聊天內容。
-        </p>
-      </section>
+    <a class="skip-link" href="#main-content">跳到主要內容</a>
+    <button class="mobile-nav-toggle" type="button" id="nav-toggle" aria-label="開啟導覽" aria-expanded="false" aria-controls="sidebar">
+      <span></span>
+      <span></span>
+      <span></span>
+    </button>
+    <div class="sidebar-overlay hidden" id="sidebar-overlay"></div>
 
-      <section class="uploader-panel">
-        <label class="dropzone" id="dropzone" for="file-input">
-          <input id="file-input" type="file" accept=".json,application/json" />
-          <span class="dropzone-title">拖曳聊天 JSON，或點一下選檔</span>
-          <span class="dropzone-hint">
-            支援 Telegram 單一對話匯出格式。就算檔案很大，也會在背景慢慢處理，不用擔心頁面卡住。
-          </span>
-        </label>
-        <div class="uploader-actions">
-          <button class="demo-button" type="button" id="demo-button" disabled>示範資料未部署</button>
-          <p class="uploader-action-hint">為避免 JSON 匯出檔被部署到公開網站，請直接拖曳你本機的 result.json 進行分析。</p>
-        </div>
-
-        <div class="status-row">
+    <div class="app-shell">
+      <aside class="sidebar" id="sidebar" aria-label="主要導覽">
+        <div class="sidebar-brand">
+          <a class="brand-mark" href="#overview" aria-label="TG Chat Footprint 首頁">
+            <svg aria-hidden="true" viewBox="0 0 48 48">
+              <circle cx="24" cy="24" r="22" fill="url(#brandGradient)"></circle>
+              <path d="M17 16c0-3.3 2.7-6 6-6h2c3.3 0 6 2.7 6 6s-2.7 6-6 6h-2l-5.5 4.5V22A6 6 0 0 1 17 16Z" fill="#fff" opacity=".95"></path>
+              <circle cx="17" cy="32" r="3.8" fill="#d8fffa"></circle>
+              <circle cx="26" cy="34" r="3.1" fill="#b9fff6"></circle>
+              <circle cx="32" cy="28" r="2.5" fill="#ecfffd"></circle>
+              <defs>
+                <linearGradient id="brandGradient" x1="7" x2="40" y1="8" y2="41">
+                  <stop stop-color="#14b8a6"></stop>
+                  <stop offset="1" stop-color="#3b82f6"></stop>
+                </linearGradient>
+              </defs>
+            </svg>
+          </a>
           <div>
-            <p class="status-label">目前進度</p>
-            <p class="status-value" id="status-text">準備好了，等你載入聊天檔案</p>
-          </div>
-          <div class="status-progress">
-            <div class="progress-track">
-              <div class="progress-fill" id="progress-fill"></div>
-            </div>
-            <p class="progress-text" id="progress-text">0%</p>
+            <p>TG Chat</p>
+            <strong>Footprint</strong>
           </div>
         </div>
 
-        <div class="file-meta" id="file-meta"></div>
-      </section>
+        <nav class="sidebar-nav" aria-label="分析章節">
+          <a class="nav-link active" href="#overview" data-section-link="overview">總覽</a>
+          <a class="nav-link" href="#time-analysis" data-section-link="time-analysis">時間分析</a>
+          <a class="nav-link" href="#conversation-rhythm" data-section-link="conversation-rhythm">對話節奏</a>
+          <a class="nav-link" href="#message-types" data-section-link="message-types">訊息類型</a>
+          <a class="nav-link" href="#language-analysis" data-section-link="language-analysis">詞頻分析</a>
+          <a class="nav-link" href="#interaction-analysis" data-section-link="interaction-analysis">互動分析</a>
+          <a class="nav-link" href="#call-analysis" data-section-link="call-analysis">通話分析</a>
+          <a class="nav-link" href="#usage-guide" data-section-link="usage-guide">使用與資料說明</a>
+        </nav>
 
-      <section class="guide-panel is-collapsed" id="guide-panel">
-        <div class="guide-head">
+        <div class="privacy-note">
+          <strong>隱私優先</strong>
+          <p>所有分析都在您的瀏覽器中進行，聊天資料不會上傳至任何伺服器。</p>
+        </div>
+
+        <footer class="sidebar-footer">
+          <p>TG Chat Footprint</p>
+          <span>MIT License</span>
+        </footer>
+      </aside>
+
+      <main class="main-content" id="main-content">
+        <header class="topbar">
           <div>
-            <p class="eyebrow">Export Guide</p>
-            <h2>如何從 Telegram 匯出對話 JSON</h2>
+            <p class="eyebrow">Privacy-first analytics</p>
+            <h1>對話足跡分析</h1>
+            <p class="topbar-copy">探索您的 Telegram 聊天數據，發現對話模式與互動節奏。</p>
           </div>
-          <div class="guide-actions">
-            <p class="guide-copy">
-              建議使用 Telegram Desktop 匯出。這個頁面需要的是 <code>result.json</code>，不是純文字或 HTML。
-            </p>
-            <button
-              class="guide-toggle"
-              type="button"
-              id="guide-toggle"
-              aria-expanded="false"
-              aria-controls="guide-content"
-            >
-              看匯出教學
-            </button>
+          <div class="topbar-actions">
+            <button class="button button-ghost" type="button" id="guide-open">使用說明</button>
+            <a class="button button-ghost" href="#usage-guide">關於</a>
           </div>
-        </div>
+        </header>
 
-        <div class="guide-content hidden" id="guide-content">
-          <div class="guide-steps">
-          <article class="guide-card">
-            <div class="guide-text">
-              <p class="guide-step">Step 1</p>
-              <h3>開啟聊天右上角選單</h3>
-              <p>
-                進入你要分析的單一對話，打開右上角的 <code>More</code> 選單，選擇
-                <code>Export chat history</code>。
-              </p>
+        <section class="import-panel" id="import-panel" aria-labelledby="import-title">
+          <div class="dropzone" id="dropzone" role="button" tabindex="0" aria-describedby="import-status privacy-copy">
+            <input id="file-input" type="file" accept=".json,application/json" aria-label="選擇 Telegram result.json 檔案" />
+            <div class="dropzone-icon" aria-hidden="true">
+              <svg viewBox="0 0 48 48">
+                <path d="M16 33h-2.5A8.5 8.5 0 0 1 12 16.1 12 12 0 0 1 35.5 19 7 7 0 0 1 34 33h-3" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></path>
+                <path d="M24 36V21m0 0-6 6m6-6 6 6" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></path>
+              </svg>
             </div>
-            <figure class="guide-figure">
-              <img
-                src="./img/telegram-export-chat-history-menu.png"
-                alt="Telegram 選單中的 Export chat history 選項"
-                loading="lazy"
-              />
-            </figure>
-          </article>
-
-          <article class="guide-card">
-            <div class="guide-text">
-              <p class="guide-step">Step 2</p>
-              <h3>格式選 JSON 後匯出</h3>
-              <p>
-                在匯出視窗把格式設成 <code>JSON</code>，時間範圍可選完整對話。若你只想分析文字，
-                媒體項目可以不勾選，檔案會更小。匯出完成後，把資料夾裡的
-                <code>result.json</code> 拖進這個頁面即可。
-              </p>
-            </div>
-            <figure class="guide-figure">
-              <img
-                src="./img/telegram-export-settings-json.png"
-                alt="Telegram chat export settings 畫面，格式選為 JSON"
-                loading="lazy"
-              />
-            </figure>
-          </article>
+            <h2 id="import-title">匯入 Telegram 匯出的 result.json 檔案</h2>
+            <p>將檔案拖放到此處，或點擊選擇檔案</p>
+            <span class="button button-primary">選擇檔案</span>
           </div>
-        </div>
-      </section>
 
-      <section class="dashboard hidden" id="dashboard">
-        <div class="summary-grid" id="summary-grid"></div>
-        <article class="panel insights-panel">
-          <div class="panel-head">
+          <div class="import-side">
+            <div class="guide-card compact">
+              <p class="eyebrow">Export guide</p>
+              <h2>如何匯出資料</h2>
+              <ol>
+                <li>開啟 Telegram Desktop</li>
+                <li>開啟要分析的對話</li>
+                <li>選擇 Export chat history</li>
+                <li>格式選擇 JSON</li>
+                <li>將 result.json 匯入本頁</li>
+              </ol>
+              <button class="button button-secondary" type="button" id="guide-open-secondary">查看詳細教學</button>
+            </div>
+
+            <div class="file-status" aria-live="polite">
+              <p class="status-label">目前狀態</p>
+              <p class="status-value" id="status-text">準備好了，等您載入聊天檔案</p>
+              <div class="file-meta-grid">
+                <span id="file-name">尚未選擇檔案</span>
+                <span id="file-size">—</span>
+              </div>
+              <div class="progress-track" aria-label="分析進度">
+                <div class="progress-fill" id="progress-fill"></div>
+              </div>
+              <p class="progress-text" id="progress-text">0%</p>
+              <p class="file-meta" id="file-meta"></p>
+            </div>
+
+            <p class="privacy-inline" id="privacy-copy">檔案只在本機瀏覽器處理，不會上傳、不會永久保存；重新整理後分析結果會消失。</p>
+          </div>
+        </section>
+
+        <section class="empty-dashboard" id="dashboard-empty" aria-labelledby="empty-title">
+          <div>
+            <p class="eyebrow">No sample data</p>
+            <h2 id="empty-title">尚未匯入資料</h2>
+            <p>匯入前不顯示假數字或假圖表。分析完成後，這裡會出現總覽、時間、節奏、訊息類型、詞頻、互動與通話等聚合結果。</p>
+          </div>
+          <ul>
+            <li>大型 JSON 會交給瀏覽器 Web Worker 背景解析。</li>
+            <li>頁面只接收聚合統計，不保存完整聊天清單。</li>
+            <li>清除分析會終止 Worker 並重置畫面狀態。</li>
+          </ul>
+        </section>
+
+        <section class="dashboard hidden" id="dashboard" aria-labelledby="dashboard-title">
+          <div class="analysis-live sr-only" id="analysis-live" aria-live="polite"></div>
+          <section class="dataset-strip" aria-labelledby="dashboard-title">
             <div>
-              <p class="panel-kicker">Insights</p>
-              <h2>關係洞察</h2>
+              <p class="eyebrow">Analysis ready</p>
+              <h2 id="dashboard-title">分析結果</h2>
+              <p id="conversation-summary">已完成本機分析。</p>
             </div>
-            <p class="panel-note">快速看出這段對話的節奏、起伏和雙向互動差異。</p>
+            <div class="dataset-actions">
+              <button class="button button-secondary" type="button" id="reselect-file">重新選擇檔案</button>
+              <button class="button button-danger" type="button" id="clear-analysis">清除分析結果</button>
+            </div>
+          </section>
+
+          <section class="dashboard-section" id="overview" data-section="overview" aria-labelledby="overview-title">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Overview</p>
+                <h2 id="overview-title">總覽</h2>
+                <p>核心摘要、關係洞察與參與者比較。</p>
+              </div>
+            </div>
+            <div class="summary-grid" id="summary-grid"></div>
+            <article class="panel insights-panel">
+              <div class="panel-head">
+                <div>
+                  <p class="panel-kicker">Insights</p>
+                  <h3>關係洞察</h3>
+                </div>
+                <p class="panel-note">快速看出這段對話的節奏、起伏和雙向互動差異。</p>
+              </div>
+              <div id="insights-grid" class="insights-grid"></div>
+            </article>
+            <article class="panel">
+              <div class="panel-head">
+                <div>
+                  <p class="panel-kicker">People</p>
+                  <h3>參與者比較</h3>
+                </div>
+                <p class="panel-note">看訊息量、字數、媒體比例，以及編輯、轉傳、連結和收到反應。</p>
+              </div>
+              <div class="table-scroll"><div id="people-table" class="table-block"></div></div>
+            </article>
+          </section>
+
+          <section class="dashboard-section" id="time-analysis" data-section="time-analysis" aria-labelledby="time-title">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Time analysis</p>
+                <h2 id="time-title">時間分析</h2>
+                <p>日度與月度趨勢、每週時段熱區、熱門活躍日期與最久未聊天區間。</p>
+              </div>
+            </div>
+            <div class="chart-grid">
+              <article class="panel wide">
+                <div class="panel-head">
+                  <div>
+                    <p class="panel-kicker">Daily Pulse</p>
+                    <h3>日度訊息趨勢</h3>
+                  </div>
+                  <p class="panel-note">先看每天的起伏，分辨這段關係是穩定往來，還是偶爾突然聊很多。</p>
+                </div>
+                <div id="daily-timeline-controls" class="timeline-controls"></div>
+                <div id="daily-timeline-chart" class="chart" aria-describedby="time-title"></div>
+              </article>
+              <article class="panel wide">
+                <div class="panel-head">
+                  <div>
+                    <p class="panel-kicker">Timeline</p>
+                    <h3>月度訊息趨勢</h3>
+                  </div>
+                  <p class="panel-note">把時間拉長到月份來看，觀察整段對話的熱度變化。</p>
+                </div>
+                <div id="timeline-chart" class="chart"></div>
+              </article>
+              <article class="panel">
+                <div class="panel-head">
+                  <div>
+                    <p class="panel-kicker">Rhythm</p>
+                    <h3>每週時段熱區</h3>
+                  </div>
+                  <p class="panel-note">看雙方通常都在什麼時段聊天。</p>
+                </div>
+                <div id="heatmap-chart" class="chart"></div>
+              </article>
+              <article class="panel">
+                <div class="panel-head">
+                  <div>
+                    <p class="panel-kicker">Density</p>
+                    <h3>熱門活躍日期</h3>
+                  </div>
+                  <p class="panel-note">找出訊息特別多、聊天特別密集的日子。</p>
+                </div>
+                <div class="table-scroll"><div id="days-table" class="table-block"></div></div>
+              </article>
+            </div>
+          </section>
+
+          <section class="dashboard-section" id="conversation-rhythm" data-section="conversation-rhythm" aria-labelledby="rhythm-title">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Cadence</p>
+                <h2 id="rhythm-title">對話節奏</h2>
+                <p>回覆速度分布、即時回覆率、雙向回覆速度、重啟頻率與誰先開口。</p>
+              </div>
+            </div>
+            <article class="panel">
+              <div class="panel-head">
+                <div>
+                  <p class="panel-kicker">Reply speed</p>
+                  <h3>回覆速度分布</h3>
+                </div>
+                <div class="panel-note-row">
+                  <p class="panel-note">前面用秒數細分，後面合併成分鐘、小時和天的區間。</p>
+                  <button class="info-button" type="button" aria-label="回覆速度說明" aria-expanded="false" aria-controls="reply-info" id="reply-info-button">i</button>
+                </div>
+              </div>
+              <div class="info-popover hidden" id="reply-info">
+                這張圖看的不是單一訊息有沒有被精準回覆，而是對話在雙方輪流發言時，通常會隔多久。
+                同一個人連續傳很多則會視為同一波發話；區間為 0-5s、5-20s、20-60s、1-5m、5-30m、30m-6h、6h-1d、&gt;1d。
+              </div>
+              <div id="reply-chart" class="chart"></div>
+            </article>
+          </section>
+
+          <section class="dashboard-section" id="message-types" data-section="message-types" aria-labelledby="types-title">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Format</p>
+                <h2 id="types-title">訊息類型</h2>
+                <p>文字、圖片、貼圖、GIF／動畫、影片、檔案與每位參與者樣態比例。</p>
+              </div>
+            </div>
+            <article class="panel">
+              <div class="panel-head">
+                <div>
+                  <p class="panel-kicker">Message mix</p>
+                  <h3>每位參與者樣態比例</h3>
+                </div>
+                <p class="panel-note">比較每位參與者常用哪些訊息形式。</p>
+              </div>
+              <div id="message-mix-panel" class="message-mix-panel"></div>
+            </article>
+          </section>
+
+          <section class="dashboard-section" id="language-analysis" data-section="language-analysis" aria-labelledby="language-title">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Language</p>
+                <h2 id="language-title">詞頻分析</h2>
+                <p>常見語詞線索、各參與者愛用詞、口頭禪候選與中文切詞限制提示。</p>
+              </div>
+            </div>
+            <div class="chart-grid">
+              <article class="panel">
+                <div class="panel-head">
+                  <div>
+                    <p class="panel-kicker">Terms</p>
+                    <h3>常見語詞線索</h3>
+                  </div>
+                  <p class="panel-note">用精確詞頻搭配候選詞切分整理，適合拿來輔助參考。</p>
+                </div>
+                <div id="terms-cloud" class="terms-cloud"></div>
+              </article>
+              <article class="panel wide">
+                <div class="panel-head">
+                  <div>
+                    <p class="panel-kicker">Phrases</p>
+                    <h3>各參與者愛用詞與口頭禪</h3>
+                  </div>
+                  <p class="panel-note">分開看每個人常講的詞和常出現的短句。</p>
+                </div>
+                <div id="phrases-panel" class="phrases-panel"></div>
+              </article>
+            </div>
+          </section>
+
+          <section class="dashboard-section" id="interaction-analysis" data-section="interaction-analysis" aria-labelledby="interaction-title">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Interactions</p>
+                <h2 id="interaction-title">互動分析</h2>
+                <p>編輯訊息、轉傳訊息、附連結訊息、收到反應與 Reaction 分布。</p>
+              </div>
+            </div>
+            <div class="chart-grid">
+              <article class="panel">
+                <div class="panel-head">
+                  <div>
+                    <p class="panel-kicker">Signals</p>
+                    <h3>互動線索</h3>
+                  </div>
+                  <p class="panel-note">讓互動風格不只看字數和頻率。</p>
+                </div>
+                <div id="signals-panel" class="signals-panel"></div>
+              </article>
+              <article class="panel">
+                <div class="panel-head">
+                  <div>
+                    <p class="panel-kicker">Reactions</p>
+                    <h3>反應分布</h3>
+                  </div>
+                  <p class="panel-note">統計最常出現的表情反應，自訂表情會分開標示。</p>
+                </div>
+                <div id="reactions-panel" class="calls-panel"></div>
+              </article>
+            </div>
+          </section>
+
+          <section class="dashboard-section" id="call-analysis" data-section="call-analysis" aria-labelledby="call-title">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Calls</p>
+                <h2 id="call-title">通話分析</h2>
+                <p>通話次數、總時長、發起者、通話時段、月份與結果。</p>
+              </div>
+            </div>
+            <article class="panel">
+              <div id="calls-panel" class="calls-panel"></div>
+            </article>
+          </section>
+        </section>
+
+        <section class="guide-panel" id="usage-guide" data-section="usage-guide" aria-labelledby="usage-title">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Usage & data</p>
+              <h2 id="usage-title">使用與資料說明</h2>
+              <p>建議使用 Telegram Desktop 匯出。這個頁面需要的是 <code>result.json</code>，不是純文字或 HTML。</p>
+            </div>
           </div>
-          <div id="insights-grid" class="insights-grid"></div>
-        </article>
+          <div class="guide-steps">
+            <article class="guide-card">
+              <div class="guide-text">
+                <p class="guide-step">Step 1</p>
+                <h3>開啟聊天右上角選單</h3>
+                <p>進入要分析的單一對話，打開右上角的 <code>More</code> 選單，選擇 <code>Export chat history</code>。</p>
+              </div>
+              <figure class="guide-figure">
+                <img src="./img/telegram-export-chat-history-menu.png" alt="Telegram 選單中的 Export chat history 選項" loading="lazy" width="960" height="720" />
+              </figure>
+            </article>
+            <article class="guide-card">
+              <div class="guide-text">
+                <p class="guide-step">Step 2</p>
+                <h3>格式選 JSON 後匯出</h3>
+                <p>在匯出視窗把格式設成 <code>JSON</code>。匯出完成後，把資料夾裡的 <code>result.json</code> 拖進這個頁面即可。</p>
+              </div>
+              <figure class="guide-figure">
+                <img src="./img/telegram-export-settings-json.png" alt="Telegram chat export settings 畫面，格式選為 JSON" loading="lazy" width="960" height="720" />
+              </figure>
+            </article>
+          </div>
+        </section>
+      </main>
+    </div>
 
-        <div class="chart-grid">
-          <article class="panel">
-            <div class="panel-head">
-              <div>
-                <p class="panel-kicker">Rhythm</p>
-                <h2>每週時段熱區</h2>
-              </div>
-              <p class="panel-note">看雙方通常都在什麼時段聊天。</p>
-            </div>
-            <div id="heatmap-chart" class="chart"></div>
-          </article>
-
-          <article class="panel">
-            <div class="panel-head">
-              <div>
-                <p class="panel-kicker">Cadence</p>
-                <h2>回覆速度分布</h2>
-              </div>
-              <div class="panel-note-row">
-                <p class="panel-note">前面用秒數細分，後面合併成分鐘、小時和天的區間，看回覆節奏會更清楚。</p>
-                <button
-                  class="info-button"
-                  type="button"
-                  aria-expanded="false"
-                  aria-controls="reply-info"
-                  id="reply-info-button"
-                >
-                  i
-                </button>
-              </div>
-            </div>
-            <div class="info-popover hidden" id="reply-info">
-              這張圖看的不是單一訊息有沒有被精準回覆，而是對話在雙方輪流發言時，通常會隔多久。
-              例如 A 說完後換 B 出聲，這段間隔就會被算進來；如果同一個人連續傳很多則，會視為同一波發話。
-              目前區間為 0-5s、5-20s、20-60s、1-5m、5-30m、30m-6h、6h-1d、&gt;1d。
-              這樣可以把大量即時來回的互動拆開來看，也能避免後面的區間切得太碎，不好判讀。
-            </div>
-            <div id="reply-chart" class="chart"></div>
-          </article>
-
-          <article class="panel wide">
-            <div class="panel-head">
-              <div>
-                <p class="panel-kicker">Daily Pulse</p>
-                <h2>日度訊息趨勢</h2>
-              </div>
-              <p class="panel-note">先看每天的起伏，分辨這段關係是穩定往來，還是偶爾突然聊很多。</p>
-            </div>
-            <div id="daily-timeline-controls" class="timeline-controls"></div>
-            <div id="daily-timeline-chart" class="chart"></div>
-          </article>
-
-          <article class="panel wide">
-            <div class="panel-head">
-              <div>
-                <p class="panel-kicker">Timeline</p>
-                <h2>月度訊息趨勢</h2>
-              </div>
-              <p class="panel-note">把時間拉長到月份來看，觀察整段對話的熱度變化。</p>
-            </div>
-            <div id="timeline-chart" class="chart"></div>
-          </article>
-
-          <article class="panel">
-            <div class="panel-head">
-              <div>
-                <p class="panel-kicker">Density</p>
-                <h2>熱門活躍日期</h2>
-              </div>
-              <p class="panel-note">找出訊息特別多、聊天特別密集的日子。</p>
-            </div>
-            <div id="days-table" class="table-block"></div>
-          </article>
-
-          <article class="panel wide">
-            <div class="panel-head">
-              <div>
-                <p class="panel-kicker">Format</p>
-                <h2>雙方訊息樣態比例</h2>
-              </div>
-              <p class="panel-note">比較每位參與者常用哪些訊息形式，幫助你看懂彼此的互動風格。</p>
-            </div>
-            <div id="message-mix-panel" class="message-mix-panel"></div>
-          </article>
-
-          <article class="panel wide">
-            <div class="panel-head">
-              <div>
-                <p class="panel-kicker">Phrases</p>
-                <h2>雙方愛用詞彙與口頭禪</h2>
-              </div>
-              <p class="panel-note">分開看每個人常講的詞和常出現的短句，比較容易看出聊天習慣。</p>
-            </div>
-            <div id="phrases-panel" class="phrases-panel"></div>
-          </article>
-
-          <article class="panel">
-            <div class="panel-head">
-              <div>
-                <p class="panel-kicker">Signals</p>
-                <h2>互動線索</h2>
-              </div>
-              <p class="panel-note">補充編輯、轉傳、連結和收到反應，讓互動風格不只看字數和頻率。</p>
-            </div>
-            <div id="signals-panel" class="signals-panel"></div>
-          </article>
-
-          <article class="panel">
-            <div class="panel-head">
-              <div>
-                <p class="panel-kicker">Reactions</p>
-                <h2>反應分布</h2>
-              </div>
-              <p class="panel-note">統計整段對話裡最常出現的表情反應，也會把自訂表情另外分開。</p>
-            </div>
-            <div id="reactions-panel" class="calls-panel"></div>
-          </article>
-
-          <article class="panel">
-            <div class="panel-head">
-              <div>
-                <p class="panel-kicker">People</p>
-                <h2>參與者比較</h2>
-              </div>
-              <p class="panel-note">看訊息量、字數、媒體比例，以及編輯、轉傳、連結和收到反應。</p>
-            </div>
-            <div id="people-table" class="table-block"></div>
-          </article>
-
-          <article class="panel">
-            <div class="panel-head">
-              <div>
-                <p class="panel-kicker">Language</p>
-                <h2>常見語詞線索</h2>
-              </div>
-              <p class="panel-note">用精確詞頻搭配候選詞切分來整理，中文長句還是可能混進片段詞，適合拿來輔助參考。</p>
-            </div>
-            <div id="terms-cloud" class="terms-cloud"></div>
-          </article>
-
-          <article class="panel wide">
-            <div class="panel-head">
-              <div>
-                <p class="panel-kicker">Calls</p>
-                <h2>通話分析</h2>
-              </div>
-              <p class="panel-note">根據 Telegram 匯出裡的通話事件，整理通話次數、時長和時段。</p>
-            </div>
-            <div id="calls-panel" class="calls-panel"></div>
-          </article>
+    <dialog class="guide-dialog" id="guide-dialog" aria-labelledby="guide-dialog-title">
+      <div class="dialog-head">
+        <div>
+          <p class="eyebrow">Local-only workflow</p>
+          <h2 id="guide-dialog-title">使用說明</h2>
         </div>
-      </section>
-    </main>
+        <button class="icon-button" type="button" id="guide-close" aria-label="關閉使用說明">×</button>
+      </div>
+      <div class="dialog-body">
+        <p>請在 Telegram Desktop 將單一對話匯出為 JSON，再把 <code>result.json</code> 匯入本頁。分析會在您的瀏覽器與瀏覽器 Web Worker 中完成，不會傳送聊天內容到 Cloudflare 或第三方服務。</p>
+        <a class="button button-secondary" href="#usage-guide" id="guide-jump">前往詳細教學</a>
+      </div>
+    </dialog>
 
     <template id="summary-card-template">
       <article class="summary-card">
+        <span class="summary-icon" aria-hidden="true"></span>
         <p class="summary-label"></p>
         <p class="summary-value"></p>
         <p class="summary-meta"></p>
