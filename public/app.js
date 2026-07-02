@@ -65,6 +65,9 @@ let peopleState = {
 };
 const CUSTOM_DICTIONARY_KEY = "tg-chat-footprint.customDictionary";
 const PARTICIPANT_COLORS = ["#14b8a6", "#3b82f6", "#8b5cf6", "#f59e0b", "#22c55e", "#ef4444", "#06b6d4", "#64748b", "#94a3b8"];
+const VALID_CONVERSATION_MODES = new Set(["direct", "group", "single"]);
+const DEFAULT_SESSION_THRESHOLD_KEY = "1800000";
+const DEFAULT_SESSION_THRESHOLD_VALUE = Number(DEFAULT_SESSION_THRESHOLD_KEY);
 
 customDictionaryInput.value = loadCustomDictionary();
 
@@ -164,20 +167,36 @@ function handleWorkerMessage({ data }) {
   }
 
   if (data.type === "result") {
-    isAnalyzing = false;
-    setInputDisabled(false);
-    setProgress(100);
-    statusText.textContent = "分析完成，可以開始看內容了";
-    renderDashboard(data.payload);
-    dashboard.classList.remove("hidden");
-    dashboardEmpty.classList.add("hidden");
-    analysisLive.textContent = "分析完成，結果已更新。";
-    scrollDashboardIntoView();
+    completeAnalysis(data.payload);
     return;
   }
 
   if (data.type === "error") {
     showError(data.message || "這份檔案目前無法讀取，請確認是否為 Telegram 匯出的 result.json。");
+  }
+}
+
+function completeAnalysis(payload) {
+  const validation = validateAnalysisResult(payload);
+  if (!validation.valid) {
+    showError(`分析完成，但結果格式不完整：${validation.errors.join("、")}`);
+    return;
+  }
+
+  try {
+    renderDashboard(validation.normalized);
+    showResults();
+    isAnalyzing = false;
+    setInputDisabled(false);
+    setProgress(100);
+    statusText.classList.remove("status-error");
+    statusText.textContent = "分析完成，可以開始看內容了";
+    fileMeta.textContent = "分析完成，結果已更新。";
+    analysisLive.textContent = "分析完成，結果已更新。";
+    scrollDashboardIntoView();
+  } catch (error) {
+    logAnalysisRenderFailure(error, validation.normalized);
+    showError("分析完成，但顯示結果時發生錯誤。請清除後重新匯入。");
   }
 }
 
@@ -196,8 +215,7 @@ function handleFile(file) {
   isAnalyzing = true;
   currentFile = file;
   clearRenderedResults();
-  dashboard.classList.add("hidden");
-  dashboardEmpty.classList.remove("hidden");
+  hideResults();
   statusText.classList.remove("status-error");
   setInputDisabled(true);
   setProgress(0);
@@ -215,6 +233,377 @@ function handleFile(file) {
   });
 }
 
+function validateAnalysisResult(result) {
+  const errors = [];
+  if (!isPlainObject(result)) {
+    return {
+      valid: false,
+      errors: ["result 必須是 object"],
+      normalized: normalizeAnalysisResult({}),
+    };
+  }
+
+  if (!isPlainObject(result.summary)) {
+    errors.push("summary");
+  }
+  if (result.conversationMode !== undefined && !VALID_CONVERSATION_MODES.has(result.conversationMode)) {
+    errors.push("conversationMode");
+  }
+  if (result.timeline !== undefined && !Array.isArray(result.timeline)) {
+    errors.push("timeline");
+  }
+  if (result.people !== undefined && !Array.isArray(result.people)) {
+    errors.push("people");
+  }
+  if (result.messageMix !== undefined && !Array.isArray(result.messageMix)) {
+    errors.push("messageMix");
+  }
+  if (result.sessionMetricsByThreshold !== undefined && !isPlainObject(result.sessionMetricsByThreshold)) {
+    errors.push("sessionMetricsByThreshold");
+  }
+  if (result.calls !== undefined && !isPlainObject(result.calls)) {
+    errors.push("calls");
+  }
+  if (result.analysisPrecision !== undefined && !isPlainObject(result.analysisPrecision)) {
+    errors.push("analysisPrecision");
+  }
+
+  return {
+    valid: !errors.includes("summary") && !errors.includes("timeline") && !errors.includes("people") && !errors.includes("messageMix"),
+    errors,
+    normalized: normalizeAnalysisResult(result),
+  };
+}
+
+function normalizeAnalysisResult(result) {
+  const source = isPlainObject(result) ? result : {};
+  const people = normalizePeople(source.people);
+  const conversationMode = VALID_CONVERSATION_MODES.has(source.conversationMode)
+    ? source.conversationMode
+    : inferConversationMode(source, people);
+  const participantCount = toSafeNumber(source.participantCount ?? source.summary?.participantCount ?? people.length, people.length);
+  const sessionMetricsByThreshold = normalizeSessionMetricsByThreshold(source.sessionMetricsByThreshold);
+  const selectedMetrics = selectSessionMetrics(
+    sessionMetricsByThreshold,
+    source.selectedSessionThreshold ?? DEFAULT_SESSION_THRESHOLD_VALUE,
+  );
+
+  return {
+    ...source,
+    conversationMode,
+    participantCount,
+    telegramChatType: typeof source.telegramChatType === "string" ? source.telegramChatType : "unknown",
+    participants: normalizeStringArray(source.participants, people.map((person) => person.name)),
+    trendViewsByTopN: isPlainObject(source.trendViewsByTopN) ? source.trendViewsByTopN : {},
+    selectedSessionThreshold: selectedMetrics?.threshold ?? DEFAULT_SESSION_THRESHOLD_VALUE,
+    sessionThresholdOptions: normalizeSessionThresholdOptions(source.sessionThresholdOptions, sessionMetricsByThreshold),
+    sessionMetricsByThreshold,
+    groupMetrics: normalizeGroupMetrics(source.groupMetrics),
+    analysisPrecision: isPlainObject(source.analysisPrecision) ? source.analysisPrecision : {},
+    wordAnalysisMeta: normalizeWordAnalysisMeta(source.wordAnalysisMeta),
+    presentationLimits: normalizePresentationLimits(source.presentationLimits, participantCount),
+    summary: normalizeSummary(source.summary, { conversationMode, participantCount }),
+    insights: normalizeInsights(source.insights),
+    timeline: normalizeArray(source.timeline),
+    dailyTimeline: normalizeArray(source.dailyTimeline),
+    heatmap: normalizeHeatmap(source.heatmap),
+    replyHistogram: normalizeReplyHistogram(source.replyHistogram),
+    topDays: normalizeArray(source.topDays),
+    topTerms: normalizeArray(source.topTerms),
+    catchphrases: normalizeCatchphrases(source.catchphrases),
+    messageMix: normalizeMessageMix(source.messageMix),
+    calls: normalizeCalls(source.calls),
+    people,
+    participantDisplay: normalizeParticipantDisplay(source.participantDisplay, participantCount),
+    topReactions: normalizeArray(source.topReactions),
+  };
+}
+
+function normalizeArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function normalizeStringArray(value, fallback = []) {
+  const source = Array.isArray(value) && value.length ? value : fallback;
+  return source.map((entry) => String(entry || "Unknown"));
+}
+
+function normalizeSummary(summary, { conversationMode, participantCount }) {
+  const source = isPlainObject(summary) ? summary : {};
+  const totalMessages = toSafeNumber(source.totalMessages, 0);
+  const activeDays = toSafeNumber(source.activeDays, 0);
+  const spanDays = toSafeNumber(source.spanDays, 0);
+  return {
+    ...source,
+    totalMessages,
+    conversationMode,
+    telegramChatType: source.telegramChatType || "unknown",
+    participantCount,
+    displayedParticipantCount: toSafeNumber(source.displayedParticipantCount, participantCount),
+    textMessages: toSafeNumber(source.textMessages, 0),
+    editedMessages: toSafeNumber(source.editedMessages, 0),
+    forwardedMessages: toSafeNumber(source.forwardedMessages, 0),
+    linkedMessages: toSafeNumber(source.linkedMessages, 0),
+    reactedMessages: toSafeNumber(source.reactedMessages, 0),
+    totalReactionCount: toSafeNumber(source.totalReactionCount, 0),
+    activeDays,
+    spanDays,
+    rangeLabel: source.rangeLabel || "暫無",
+    avgPerActiveDay: source.avgPerActiveDay || "0",
+    activeDensityLabel: source.activeDensityLabel || "暫無",
+    activeDensityMeta: source.activeDensityMeta || "目前資料還不夠",
+    balanceLabel: source.balanceLabel || "暫無",
+    balanceMeta: source.balanceMeta || "目前資料還不夠",
+    immediateReplyLabel: source.immediateReplyLabel || "暫無",
+    immediateReplyMeta: source.immediateReplyMeta || "目前還沒有足夠的短間隔回覆",
+    restartReplyLabel: source.restartReplyLabel || "暫無",
+    restartReplyMeta: source.restartReplyMeta || "目前還沒有足夠的重啟對話",
+  };
+}
+
+function normalizeInsights(insights) {
+  const source = isPlainObject(insights) ? insights : {};
+  return {
+    activeHours: normalizeInsightCard(source.activeHours),
+    burstiness: normalizeInsightCard(source.burstiness),
+    stickiness: normalizeInsightCard(source.stickiness),
+    restartFrequency: normalizeInsightCard(source.restartFrequency),
+    replyAsymmetry: normalizeInsightCard(source.replyAsymmetry),
+    initiative: normalizeInsightCard(source.initiative),
+  };
+}
+
+function normalizeInsightCard(card) {
+  const source = isPlainObject(card) ? card : {};
+  return {
+    label: source.label || "暫無",
+    meta: source.meta || "目前資料還不夠",
+    rows: normalizeArray(source.rows),
+  };
+}
+
+function normalizeSessionMetricsByThreshold(metricsByThreshold) {
+  const source = isPlainObject(metricsByThreshold) ? metricsByThreshold : {};
+  const entries = Object.entries(source);
+  const output = {};
+  if (!entries.length) {
+    output[DEFAULT_SESSION_THRESHOLD_KEY] = normalizeSessionMetrics({});
+    return output;
+  }
+  for (const [key, metrics] of entries) {
+    output[key] = normalizeSessionMetrics(metrics, Number(key));
+  }
+  if (!output[DEFAULT_SESSION_THRESHOLD_KEY]) {
+    output[DEFAULT_SESSION_THRESHOLD_KEY] = normalizeSessionMetrics({});
+  }
+  return output;
+}
+
+function normalizeSessionMetrics(metrics, threshold = DEFAULT_SESSION_THRESHOLD_VALUE) {
+  const source = isPlainObject(metrics) ? metrics : {};
+  return {
+    ...source,
+    threshold: toSafeNumber(source.threshold, threshold),
+    thresholdLabel: source.thresholdLabel || formatThresholdLabelForUi(threshold),
+    quickReplyThreshold: toSafeNumber(source.quickReplyThreshold, Math.min(threshold, 60 * 60_000)),
+    quickReplyThresholdLabel: source.quickReplyThresholdLabel || formatThresholdLabelForUi(Math.min(threshold, 60 * 60_000)),
+    sessionCount: toSafeNumber(source.sessionCount, 0),
+    sessionMedian: source.sessionMedian ?? null,
+    restartCount: toSafeNumber(source.restartCount, 0),
+    restartMedian: source.restartMedian ?? null,
+    restartInitiators: normalizeArray(source.restartInitiators),
+    longestSilence: source.longestSilence ?? null,
+    turnSwitchCount: toSafeNumber(source.turnSwitchCount, 0),
+    quickReplyCount: toSafeNumber(source.quickReplyCount, 0),
+    replyBuckets: Array.isArray(source.replyBuckets) ? source.replyBuckets : [],
+    replyMedian: source.replyMedian ?? null,
+    replyP90: source.replyP90 ?? null,
+    directionalReplies: normalizeArray(source.directionalReplies),
+    precision: isPlainObject(source.precision) ? source.precision : {},
+  };
+}
+
+function normalizeSessionThresholdOptions(options, metricsByThreshold) {
+  if (Array.isArray(options) && options.length) {
+    return options;
+  }
+  return Object.values(metricsByThreshold).map((metrics) => ({
+    value: metrics.threshold,
+    label: metrics.thresholdLabel,
+  }));
+}
+
+function normalizeGroupMetrics(groupMetrics) {
+  const source = isPlainObject(groupMetrics) ? groupMetrics : {};
+  return {
+    activeParticipantCount: toSafeNumber(source.activeParticipantCount, 0),
+    topParticipantShare: toSafeNumber(source.topParticipantShare, 0),
+    topParticipantShareLabel: source.topParticipantShareLabel || "0.0%",
+    topThreeShare: toSafeNumber(source.topThreeShare, 0),
+    topThreeShareLabel: source.topThreeShareLabel || "0.0%",
+    medianMessagesPerParticipant: toSafeNumber(source.medianMessagesPerParticipant, 0),
+    starterRanking: normalizeArray(source.starterRanking),
+    concentrationLevel: source.concentrationLevel || "low",
+    concentrationLabel: source.concentrationLabel || "目前資料還不夠",
+  };
+}
+
+function normalizeWordAnalysisMeta(meta) {
+  const source = isPlainObject(meta) ? meta : {};
+  return {
+    tokenizer: source.tokenizer || "unknown",
+    locale: source.locale || "zh-Hant",
+    customDictionaryCount: toSafeNumber(source.customDictionaryCount, 0),
+    analyzedTextMessageCount: toSafeNumber(source.analyzedTextMessageCount, 0),
+    rejectedTokenCount: toSafeNumber(source.rejectedTokenCount, 0),
+  };
+}
+
+function normalizePresentationLimits(limits, participantCount) {
+  const source = isPlainObject(limits) ? limits : {};
+  return {
+    trendTopNDefault: toSafeNumber(source.trendTopNDefault, 8),
+    trendTopNOptions: Array.isArray(source.trendTopNOptions) ? source.trendTopNOptions : [5, 8, 12, 20],
+    participantTableTotal: toSafeNumber(source.participantTableTotal, participantCount),
+    personalWordStatsComputedFor: toSafeNumber(source.personalWordStatsComputedFor, participantCount),
+    personalTypeStatsComputedFor: toSafeNumber(source.personalTypeStatsComputedFor, participantCount),
+  };
+}
+
+function normalizeHeatmap(heatmap) {
+  if (!Array.isArray(heatmap)) {
+    return Array.from({ length: 7 }, () => Array(24).fill(0));
+  }
+  return Array.from({ length: 7 }, (_, dayIndex) => {
+    const row = Array.isArray(heatmap[dayIndex]) ? heatmap[dayIndex] : [];
+    return Array.from({ length: 24 }, (_, hour) => toSafeNumber(row[hour], 0));
+  });
+}
+
+function normalizeReplyHistogram(histogram) {
+  const source = isPlainObject(histogram) ? histogram : {};
+  return {
+    bins: normalizeArray(source.bins),
+    precision: source.precision || "exact",
+    longestGapLabel: source.longestGapLabel || "暫無",
+    longestGapRange: source.longestGapRange || "目前資料還不夠",
+  };
+}
+
+function normalizeCatchphrases(catchphrases) {
+  return normalizeArray(catchphrases).map((person) => ({
+    ...person,
+    name: person?.name || "Unknown",
+    messageShare: person?.messageShare || "0.0",
+    topWords: normalizeArray(person?.topWords).map(normalizeCountEntry),
+    topPhrases: normalizeArray(person?.topPhrases).map((entry) => ({
+      ...entry,
+      term: entry?.term || "",
+      totalCount: toSafeNumber(entry?.totalCount, 0),
+      messageCount: toSafeNumber(entry?.messageCount ?? entry?.count, 0),
+      activeDayCount: toSafeNumber(entry?.activeDayCount, 0),
+      count: toSafeNumber(entry?.messageCount ?? entry?.count ?? entry?.totalCount, 0),
+    })),
+    toneMarkers: normalizeArray(person?.toneMarkers).map(normalizeCountEntry),
+  }));
+}
+
+function normalizeMessageMix(messageMix) {
+  return normalizeArray(messageMix).map((person) => ({
+    ...person,
+    name: person?.name || "Unknown",
+    total: toSafeNumber(person?.total, 0),
+    categories: normalizeArray(person?.categories),
+  }));
+}
+
+function normalizeCountEntry(entry) {
+  return {
+    ...entry,
+    term: entry?.term || "",
+    label: entry?.label || entry?.term || "",
+    count: toSafeNumber(entry?.count, 0),
+  };
+}
+
+function normalizeCalls(calls) {
+  const source = isPlainObject(calls) ? calls : {};
+  const totalCalls = toSafeNumber(source.totalCalls ?? source.total, 0);
+  return {
+    ...source,
+    total: toSafeNumber(source.total, totalCalls),
+    totalCalls,
+    connected: toSafeNumber(source.connected, 0),
+    missed: toSafeNumber(source.missed, 0),
+    totalDurationSeconds: toSafeNumber(source.totalDurationSeconds, 0),
+    totalDurationLabel: source.totalDurationLabel || "0 秒",
+    avgDurationLabel: source.avgDurationLabel || "0 秒",
+    callsWithDuration: toSafeNumber(source.callsWithDuration, 0),
+    callsWithoutDuration: toSafeNumber(source.callsWithoutDuration, 0),
+    durationCompletenessRate: toSafeNumber(source.durationCompletenessRate, 0),
+    durationCompletenessLabel: source.durationCompletenessLabel || "0.0%",
+    callsWithResult: toSafeNumber(source.callsWithResult, 0),
+    callsWithoutResult: toSafeNumber(source.callsWithoutResult, 0),
+    byParticipant: normalizeArray(source.byParticipant),
+    byMonth: normalizeArray(source.byMonth),
+    byHour: normalizeArray(source.byHour),
+    outcomes: normalizeArray(source.outcomes),
+    topCaller: source.topCaller || null,
+    topHour: source.topHour || null,
+  };
+}
+
+function normalizePeople(people) {
+  return normalizeArray(people).map((person) => ({
+    ...person,
+    name: person?.name || "Unknown",
+    messages: toSafeNumber(person?.messages, 0),
+    characters: toSafeNumber(person?.characters, 0),
+    avgChars: toSafeNumber(person?.avgChars, 0),
+    mediaShare: person?.mediaShare ?? "0.0",
+    edits: toSafeNumber(person?.edits, 0),
+    forwards: toSafeNumber(person?.forwards, 0),
+    links: toSafeNumber(person?.links, 0),
+    reactionCountReceived: toSafeNumber(person?.reactionCountReceived, 0),
+    reactionsReceived: normalizeArray(person?.reactionsReceived),
+  }));
+}
+
+function normalizeParticipantDisplay(display, participantCount) {
+  const source = isPlainObject(display) ? display : {};
+  return {
+    total: toSafeNumber(source.total, participantCount),
+    timelineLimit: toSafeNumber(source.timelineLimit, 8),
+    timelineHasOther: Boolean(source.timelineHasOther),
+  };
+}
+
+function inferConversationMode(source, people) {
+  const participantCount = toSafeNumber(source.participantCount ?? source.summary?.participantCount ?? people.length, people.length);
+  if (participantCount <= 1) {
+    return "single";
+  }
+  return participantCount === 2 ? "direct" : "group";
+}
+
+function toSafeNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function formatThresholdLabelForUi(ms) {
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 60) {
+    return `${minutes} 分鐘`;
+  }
+  const hours = ms / 3_600_000;
+  return Number.isInteger(hours) ? `${hours} 小時` : `${hours.toFixed(1)} 小時`;
+}
+
 function setProgress(value) {
   const safeValue = Math.max(0, Math.min(100, value));
   progressFill.style.width = `${safeValue}%`;
@@ -223,7 +612,8 @@ function setProgress(value) {
 
 function renderDashboard(payload) {
   currentPayload = payload;
-  currentSessionThreshold = currentSessionThreshold || payload.selectedSessionThreshold || Number(Object.keys(payload.sessionMetricsByThreshold || {})[0]);
+  const selectedMetrics = selectSessionMetrics(payload.sessionMetricsByThreshold, currentSessionThreshold || payload.selectedSessionThreshold);
+  currentSessionThreshold = selectedMetrics?.threshold || payload.selectedSessionThreshold || DEFAULT_SESSION_THRESHOLD_VALUE;
   currentTrendTopN = payload.presentationLimits?.trendTopNDefault || currentTrendTopN;
   trendTopNSelect.value = String(currentTrendTopN);
   renderAnalysisControls(payload);
@@ -243,7 +633,8 @@ function renderDashboard(payload) {
 
 function renderAnalysisControls(payload) {
   conversationModeBadge.textContent = getConversationModeLabel(payload.conversationMode);
-  sessionThresholdSelect.innerHTML = (payload.sessionThresholdOptions || [])
+  const options = Array.isArray(payload.sessionThresholdOptions) ? payload.sessionThresholdOptions : [];
+  sessionThresholdSelect.innerHTML = options
     .map((option) => `<option value="${option.value}">${escapeHtml(option.label)}</option>`)
     .join("");
   sessionThresholdSelect.value = String(currentSessionThreshold || payload.selectedSessionThreshold);
@@ -274,8 +665,8 @@ function renderTrendViews() {
     timeline: currentPayload.timeline,
     dailyTimeline: currentPayload.dailyTimeline,
   };
-  renderTimeline(view.timeline, view.participants);
-  renderDailyTimeline(view.dailyTimeline, view.participants);
+  renderTimeline(normalizeArray(view.timeline), normalizeStringArray(view.participants));
+  renderDailyTimeline(normalizeArray(view.dailyTimeline), normalizeStringArray(view.participants));
 }
 
 function renderDatasetStrip(payload) {
@@ -287,9 +678,13 @@ function renderDatasetStrip(payload) {
 }
 
 function getSelectedSessionMetrics() {
-  const metricsByThreshold = currentPayload?.sessionMetricsByThreshold || {};
-  const key = String(currentSessionThreshold || currentPayload?.selectedSessionThreshold || "");
-  return metricsByThreshold[key] || Object.values(metricsByThreshold)[0] || null;
+  return selectSessionMetrics(currentPayload?.sessionMetricsByThreshold, currentSessionThreshold || currentPayload?.selectedSessionThreshold);
+}
+
+function selectSessionMetrics(metricsByThreshold, selectedThreshold) {
+  const metrics = isPlainObject(metricsByThreshold) ? metricsByThreshold : {};
+  const key = String(selectedThreshold || "");
+  return metrics[key] || metrics[DEFAULT_SESSION_THRESHOLD_KEY] || Object.values(metrics)[0] || null;
 }
 
 function buildSummaryForThreshold(summary, metrics) {
@@ -335,7 +730,7 @@ function buildInsightsForThreshold(baseInsights, metrics, payload) {
 }
 
 function buildReplyHistogramForThreshold(metrics) {
-  if (!metrics) {
+  if (!metrics || !Array.isArray(metrics.replyBuckets)) {
     return { bins: [] };
   }
   return {
@@ -584,8 +979,7 @@ function clearAnalysis() {
 function resetUiState() {
   isAnalyzing = false;
   setInputDisabled(false);
-  dashboard.classList.add("hidden");
-  dashboardEmpty.classList.remove("hidden");
+  hideResults();
   statusText.classList.remove("status-error");
   statusText.textContent = "準備好了，等您載入聊天檔案";
   fileName.textContent = "尚未選擇檔案";
@@ -610,14 +1004,63 @@ function setInputDisabled(disabled) {
   reselectFileButton.disabled = disabled;
 }
 
+function showResults() {
+  dashboard.hidden = false;
+  dashboard.classList.remove("hidden");
+  dashboard.removeAttribute("aria-hidden");
+  dashboardEmpty.hidden = true;
+  dashboardEmpty.classList.add("hidden");
+  dashboardEmpty.setAttribute("aria-hidden", "true");
+  document.body.dataset.analysisState = "complete";
+}
+
+function hideResults() {
+  dashboard.hidden = true;
+  dashboard.classList.add("hidden");
+  dashboard.setAttribute("aria-hidden", "true");
+  dashboardEmpty.hidden = false;
+  dashboardEmpty.classList.remove("hidden");
+  dashboardEmpty.removeAttribute("aria-hidden");
+  document.body.dataset.analysisState = "idle";
+}
+
 function showError(message) {
   isAnalyzing = false;
   setInputDisabled(false);
   terminateWorker();
+  hideResults();
   statusText.textContent = message;
   statusText.classList.add("status-error");
   fileMeta.textContent = "請清除後重新匯入，或確認檔案是否為 Telegram Desktop 匯出的 result.json。";
   analysisLive.textContent = `分析失敗：${message}`;
+}
+
+function logAnalysisRenderFailure(error, payload) {
+  const topLevelFields = [
+    "summary",
+    "conversationMode",
+    "participantCount",
+    "telegramChatType",
+    "groupMetrics",
+    "sessionMetricsByThreshold",
+    "analysisPrecision",
+    "wordAnalysisMeta",
+    "presentationLimits",
+    "calls",
+    "timeline",
+    "dailyTimeline",
+    "people",
+    "messageMix",
+  ];
+  const missingTopLevelFields = topLevelFields.filter((field) => !(field in (payload || {})));
+  console.error("Analysis render failed", {
+    name: error instanceof Error ? error.name : "UnknownError",
+    message: error instanceof Error ? error.message : String(error),
+    stack: error instanceof Error ? error.stack : "",
+    missingTopLevelFields,
+    conversationMode: payload?.conversationMode,
+    hasSummary: Boolean(payload?.summary),
+  });
 }
 
 function isLikelyJsonFile(file) {
@@ -1046,12 +1489,13 @@ function renderReplyHistogram(histogram) {
   const totalReplies = histogram.bins.reduce((sum, bin) => sum + bin.count, 0);
   const breakdown = histogram.bins
     .map((bin) => {
-      const share = totalReplies ? ((bin.count / totalReplies) * 100).toFixed(1) : "0.0";
-      const tooltip = `${bin.label}\n${bin.count.toLocaleString()} 次輪流回覆\n占比 ${share}%`;
+      const count = toSafeNumber(bin.count, 0);
+      const share = totalReplies ? ((count / totalReplies) * 100).toFixed(1) : "0.0";
+      const tooltip = `${bin.label}\n${formatCount(count)} 次輪流回覆\n占比 ${share}%`;
       return `<div class="reply-breakdown-row has-tooltip" data-tooltip="${escapeAttribute(tooltip)}">
         <div class="reply-breakdown-meta">
           <strong>${bin.label}</strong>
-          <span>${bin.count.toLocaleString()} 次</span>
+          <span>${formatCount(count)} 次</span>
         </div>
         <div class="reply-breakdown-bar"><span style="width:${share}%"></span></div>
         <div class="reply-breakdown-share">${share}%</div>
@@ -1073,28 +1517,34 @@ function renderReplyHistogram(histogram) {
 }
 
 function renderTopDays(topDays) {
+  topDays = normalizeArray(topDays);
   if (!topDays.length) {
     daysTable.innerHTML = `<div class="empty-state">目前還沒有可用的每日統計。</div>`;
     return;
   }
 
-  const maxCount = Math.max(...topDays.map((entry) => entry.total), 1);
+  const maxCount = Math.max(...topDays.map((entry) => toSafeNumber(entry.total, 0)), 1);
   daysTable.innerHTML = [
     `<div class="table-row header"><div>日期</div><div>總訊息</div><div>雙方分布</div><div>密度</div></div>`,
     ...topDays.map((entry) => {
-      const participants = Object.entries(entry.byParticipant)
+      const byParticipant = isPlainObject(entry.byParticipant) ? entry.byParticipant : {};
+      const participants = Object.entries(byParticipant)
         .map(([name, count]) => `${escapeHtml(name)} ${count}`)
         .join(" / ");
-      const tooltip = `${entry.date} ${entry.weekday}\n總訊息: ${entry.total.toLocaleString()} 則\n${Object.entries(entry.byParticipant)
+      const total = toSafeNumber(entry.total, 0);
+      const date = entry.date || "—";
+      const weekday = entry.weekday || "";
+      const tooltip = `${date} ${weekday}\n總訊息: ${total.toLocaleString()} 則\n${Object.entries(byParticipant)
         .map(([name, count]) => `${name}: ${count.toLocaleString()} 則`)
         .join("\n")}`;
-      return `<div class="table-row has-tooltip" data-tooltip="${escapeAttribute(tooltip)}"><div class="table-cell"><strong>${entry.date}</strong><span class="table-muted">${entry.weekday}</span></div><div class="table-cell"><strong>${entry.total.toLocaleString()}</strong></div><div class="table-cell">${participants}</div><div class="table-cell"><div class="mini-bar"><span style="width:${(entry.total / maxCount) * 100}%"></span></div></div></div>`;
+      return `<div class="table-row has-tooltip" data-tooltip="${escapeAttribute(tooltip)}"><div class="table-cell"><strong>${date}</strong><span class="table-muted">${weekday}</span></div><div class="table-cell"><strong>${total.toLocaleString()}</strong></div><div class="table-cell">${participants}</div><div class="table-cell"><div class="mini-bar"><span style="width:${(total / maxCount) * 100}%"></span></div></div></div>`;
     }),
   ].join("");
   bindTooltips(daysTable);
 }
 
 function renderTerms(topTerms) {
+  topTerms = normalizeArray(topTerms).map(normalizeCountEntry);
   if (!topTerms.length) {
     termsCloud.innerHTML = `<div class="empty-state">文字訊息太少，還整理不出常見詞。</div>`;
     return;
@@ -1104,7 +1554,7 @@ function renderTerms(topTerms) {
   termsCloud.innerHTML = topTerms
     .map((term) => {
       const emphasis = 0.9 + (term.count / maxCount) * 0.7;
-      return `<span class="term-chip has-tooltip" data-tooltip="${escapeAttribute(`${term.term}\n出現 ${term.count.toLocaleString()} 次`)}" style="font-size:${emphasis}rem"><strong>${escapeHtml(term.term)}</strong>${term.count}</span>`;
+      return `<span class="term-chip has-tooltip" data-tooltip="${escapeAttribute(`${term.term}\n出現 ${formatCount(term.count)} 次`)}" style="font-size:${emphasis}rem"><strong>${escapeHtml(term.term)}</strong>${formatCount(term.count)}</span>`;
     })
     .join("");
   bindTooltips(termsCloud);
@@ -1148,6 +1598,7 @@ function renderSignals(summary) {
 }
 
 function renderTopReactions(topReactions, totalReactionCount) {
+  topReactions = normalizeArray(topReactions);
   if (!topReactions.length) {
     reactionsPanel.innerHTML = `<div class="empty-state">這份聊天裡還沒有表情反應資料。</div>`;
     return;
@@ -1155,11 +1606,13 @@ function renderTopReactions(topReactions, totalReactionCount) {
 
   reactionsPanel.innerHTML = topReactions
     .map((reaction) => {
-      const share = totalReactionCount ? ((reaction.count / totalReactionCount) * 100).toFixed(1) : "0.0";
-      const tooltip = `${reaction.label}\n${reaction.count.toLocaleString()} 次表情反應\n占比 ${share}%`;
+      const count = toSafeNumber(reaction.count, 0);
+      const label = reaction.label || "未知反應";
+      const share = totalReactionCount ? ((count / totalReactionCount) * 100).toFixed(1) : "0.0";
+      const tooltip = `${label}\n${count.toLocaleString()} 次表情反應\n占比 ${share}%`;
       return `<div class="call-row has-tooltip" data-tooltip="${escapeAttribute(tooltip)}">
         <div class="call-row-meta">
-          <strong>${escapeHtml(reaction.label)}</strong>
+          <strong>${escapeHtml(label)}</strong>
           <span>${reaction.kind === "custom" ? "自訂表情" : "預設表情"}</span>
         </div>
         <div class="call-row-bar warm"><span style="width:${share}%"></span></div>
@@ -1278,7 +1731,7 @@ function renderCatchphrases(catchphrases) {
         ? person.topWords
             .map(
               (entry) =>
-                `<span class="phrase-chip has-tooltip" data-tooltip="${escapeAttribute(`${entry.term}\n${person.name} 用了 ${entry.count.toLocaleString()} 次`)}"><strong>${escapeHtml(entry.term)}</strong>${entry.count}</span>`,
+                `<span class="phrase-chip has-tooltip" data-tooltip="${escapeAttribute(`${entry.term}\n${person.name} 用了 ${formatCount(entry.count)} 次`)}"><strong>${escapeHtml(entry.term)}</strong>${formatCount(entry.count)}</span>`,
             )
             .join("")
         : `<span class="table-muted">目前還看不出明顯的常用詞。</span>`;
@@ -1287,7 +1740,7 @@ function renderCatchphrases(catchphrases) {
         ? person.topPhrases
             .map(
               (entry) =>
-                `<span class="phrase-chip warm has-tooltip" data-tooltip="${escapeAttribute(`${entry.term}\n${person.name} 有 ${entry.count.toLocaleString()} 則訊息出現這句`)}">「${escapeHtml(entry.term)}」<strong>${entry.count}</strong></span>`,
+                `<span class="phrase-chip warm has-tooltip" data-tooltip="${escapeAttribute(`${entry.term}\n${person.name} 有 ${formatCount(entry.count)} 則訊息出現這句`)}">「${escapeHtml(entry.term)}」<strong>${formatCount(entry.count)}</strong></span>`,
             )
             .join("")
         : `<span class="table-muted">目前還看不出明顯的固定短句。</span>`;
@@ -1322,11 +1775,12 @@ function renderMessageMix(messageMix) {
     .map((person) => {
       const rows = person.categories
         .map((category) => {
-          const tooltip = `${person.name}\n${category.label}: ${category.count.toLocaleString()} 則\n占比 ${category.share}%`;
+          const count = toSafeNumber(category.count, 0);
+          const tooltip = `${person.name}\n${category.label}: ${formatCount(count)} 則\n占比 ${category.share}%`;
           return `<div class="mix-row has-tooltip" data-tooltip="${escapeAttribute(tooltip)}">
             <div class="mix-meta">
               <strong>${escapeHtml(category.label)}</strong>
-              <span>${category.count.toLocaleString()} 則</span>
+              <span>${formatCount(count)} 則</span>
             </div>
             <div class="mix-bar"><span style="width:${category.share}%"></span></div>
             <div class="mix-share">${category.share}%</div>
@@ -1377,7 +1831,7 @@ function renderCalls(calls) {
     {
       label: "最常通話時段",
       value: calls.topHour?.label || "暫無",
-      meta: calls.topHour ? `${calls.topHour.count.toLocaleString()} 次通話` : "目前資料還不夠",
+      meta: calls.topHour ? `${formatCount(calls.topHour.count)} 次通話` : "目前資料還不夠",
     },
   ]
     .map(
@@ -1391,10 +1845,10 @@ function renderCalls(calls) {
 
   const peopleRows = calls.byParticipant
     .map(
-      (person) => `<div class="call-row has-tooltip" data-tooltip="${escapeAttribute(`${person.name}\n通話 ${person.count.toLocaleString()} 次\n占比 ${person.share}%\n累積 ${person.durationLabel}`)}">
+      (person) => `<div class="call-row has-tooltip" data-tooltip="${escapeAttribute(`${person.name}\n通話 ${formatCount(person.count)} 次\n占比 ${person.share}%\n累積 ${person.durationLabel}`)}">
         <div class="call-row-meta">
           <strong>${escapeHtml(person.name)}</strong>
-          <span>${person.count.toLocaleString()} 次 / ${person.durationLabel}</span>
+          <span>${formatCount(person.count)} 次 / ${person.durationLabel}</span>
         </div>
         <div class="call-row-bar"><span style="width:${person.share}%"></span></div>
         <div class="call-row-share">${person.share}%</div>
@@ -1404,10 +1858,10 @@ function renderCalls(calls) {
 
   const monthRows = calls.byMonth
     .map(
-      (entry) => `<div class="call-row has-tooltip" data-tooltip="${escapeAttribute(`${entry.label}\n${entry.count.toLocaleString()} 次通話\n累積 ${entry.durationLabel}`)}">
+      (entry) => `<div class="call-row has-tooltip" data-tooltip="${escapeAttribute(`${entry.label}\n${formatCount(entry.count)} 次通話\n累積 ${entry.durationLabel}`)}">
         <div class="call-row-meta">
           <strong>${entry.label}</strong>
-          <span>${entry.count.toLocaleString()} 次 / ${entry.durationLabel}</span>
+          <span>${formatCount(entry.count)} 次 / ${entry.durationLabel}</span>
         </div>
         <div class="call-row-bar warm"><span style="width:${entry.share}%"></span></div>
         <div class="call-row-share">${entry.share}%</div>
@@ -1417,10 +1871,10 @@ function renderCalls(calls) {
 
   const hourRows = calls.byHour
     .map(
-      (entry) => `<div class="call-row has-tooltip" data-tooltip="${escapeAttribute(`${entry.label}\n${entry.count.toLocaleString()} 次通話`)}">
+      (entry) => `<div class="call-row has-tooltip" data-tooltip="${escapeAttribute(`${entry.label}\n${formatCount(entry.count)} 次通話`)}">
         <div class="call-row-meta">
           <strong>${entry.label}</strong>
-          <span>${entry.count.toLocaleString()} 次</span>
+          <span>${formatCount(entry.count)} 次</span>
         </div>
         <div class="call-row-bar"><span style="width:${entry.share}%"></span></div>
         <div class="call-row-share">${entry.share}%</div>
@@ -1430,10 +1884,10 @@ function renderCalls(calls) {
 
   const outcomeChips = calls.outcomes
     .map(
-      (entry) => `<div class="call-row has-tooltip" data-tooltip="${escapeAttribute(`${entry.label}\n${entry.count.toLocaleString()} 次\n占比 ${entry.share}%`)}">
+      (entry) => `<div class="call-row has-tooltip" data-tooltip="${escapeAttribute(`${entry.label}\n${formatCount(entry.count)} 次\n占比 ${entry.share}%`)}">
         <div class="call-row-meta">
           <strong>${escapeHtml(entry.label)}</strong>
-          <span>${entry.count.toLocaleString()} 次</span>
+          <span>${formatCount(entry.count)} 次</span>
         </div>
         <div class="call-row-bar warm"><span style="width:${entry.share}%"></span></div>
         <div class="call-row-share">${entry.share}%</div>
@@ -1489,6 +1943,11 @@ function formatShare(part, total) {
     return "0.0%";
   }
   return `${((part / total) * 100).toFixed(1)}%`;
+}
+
+function formatCount(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toLocaleString() : "0";
 }
 
 function formatDuration(ms) {
