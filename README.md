@@ -25,6 +25,27 @@ TG Chat Footprint is an independent open-source project and is not affiliated wi
 - 原生 HTML、CSS、JavaScript，沒有 React、Vue、Vite 或其他框架
 - 可部署到 Cloudflare Workers Static Assets
 
+## 與原版 Telegram Chat Lens 的主要差異
+
+TG Chat Footprint 基於 denny0223 的 Telegram Chat Lens 修改，並在保留純前端、本機分析與 Web Worker 架構的前提下，進行以下擴充：
+
+- 重新設計整體介面、導覽與行動版體驗
+- 改為 Cloudflare Workers Static Assets 部署
+- 移除第三方分析與追蹤，強化 CSP 與安全 headers
+- 新增單人、一對一與群組模式辨識
+- 為群組聊天加入專用摘要、集中度與參與者分析
+- 將回覆速度與對話重啟分開計算
+- 新增可調整的對話斷點：10 分鐘、30 分鐘、1 小時、6 小時
+- 改進中文詞彙切分、口頭禪候選與自訂詞典
+- 改善大型群組的搜尋、排序、分頁與 Top N 顯示
+- 將大型資料統計區分為精確與近似模式
+- 改善通話欄位缺失時的完整度與平均計算
+- 增加錯誤診斷、渲染契約驗證與回歸測試
+
+原始專案：[Telegram Chat Lens](https://github.com/denny0223/telegram-chat-lens)
+
+本專案與 Telegram 官方無關。
+
 ## 隱私設計
 
 - 所有 Telegram JSON 解析都在使用者瀏覽器內完成
@@ -203,8 +224,10 @@ wrangler.jsonc
 - 不得加入聊天 telemetry 或遠端錯誤回報
 - 修改分析演算法需附測試與定義說明
 
-## 授權與 attribution
+## 授權與來源
 
-Based on Telegram Chat Lens by denny0223.
+TG Chat Footprint is based on [Telegram Chat Lens](https://github.com/denny0223/telegram-chat-lens) by denny0223.
+
+本專案保留原始專案的 MIT License 與著作權聲明。
 
 Licensed under the MIT License. See [LICENSE](./LICENSE).
