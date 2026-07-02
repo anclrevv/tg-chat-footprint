@@ -3,7 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
 
-const workerPath = path.join(__dirname, "..", "worker.js");
+const workerPath = path.join(__dirname, "..", "public", "worker.js");
 const workerCode = fs.readFileSync(workerPath, "utf8");
 const context = {
   console,

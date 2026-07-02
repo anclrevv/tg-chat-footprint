@@ -1,0 +1,10 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "telegram-chat-lens",
+  "main": "./src/index.js",
+  "compatibility_date": "2026-07-02",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  }
+}

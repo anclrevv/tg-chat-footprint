@@ -8,21 +8,12 @@
       name="description"
       content="直接在瀏覽器分析 Telegram 對話匯出 JSON，不用一次載入整份聊天紀錄。"
     />
-    <script async src="https://www.googletagmanager.com/gtag/js?id=G-44VGJ93RTK"></script>
-    <script>
-      window.dataLayer = window.dataLayer || [];
-      function gtag() {
-        dataLayer.push(arguments);
-      }
-      gtag("js", new Date());
-      gtag("config", "G-44VGJ93RTK");
-    </script>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
     <main class="app-shell">
       <section class="hero">
-        <p class="eyebrow">GitHub Pages Ready</p>
+        <p class="eyebrow">Cloudflare Workers Ready</p>
         <h1>Telegram Chat Lens</h1>
         <p class="hero-copy">
           把 Telegram 匯出的 <code>result.json</code> 拖進來，就能直接在瀏覽器裡看到這段對話的節奏、活躍時段和互動樣貌。
@@ -39,8 +30,8 @@
           </span>
         </label>
         <div class="uploader-actions">
-          <button class="demo-button" type="button" id="demo-button">載入 demo.json 預覽</button>
-          <p class="uploader-action-hint">如果你還沒有準備好匯出檔，可以先用匿名化示範資料看看整體效果。</p>
+          <button class="demo-button" type="button" id="demo-button" disabled>示範資料未部署</button>
+          <p class="uploader-action-hint">為避免 JSON 匯出檔被部署到公開網站，請直接拖曳你本機的 result.json 進行分析。</p>
         </div>
 
         <div class="status-row">

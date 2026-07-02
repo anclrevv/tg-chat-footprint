@@ -54,6 +54,10 @@ fileInput.addEventListener("change", (event) => {
 });
 
 demoButton.addEventListener("click", async () => {
+  if (demoButton.disabled) {
+    return;
+  }
+
   demoButton.disabled = true;
   statusText.textContent = "正在載入示範資料";
   fileMeta.textContent = "正在讀取匿名化 demo.json";

@@ -16,11 +16,15 @@ __pycache__/
 
 # Node local tooling
 node_modules/
+.wrangler/
+.dev.vars
 
 # Telegram export data
 result.json
 exports/
+telegram-export/
 tmp/
+json/*.json
 
 # Large local assets that may contain private chat exports
 *.zip
