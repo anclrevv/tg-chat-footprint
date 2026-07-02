@@ -301,14 +301,207 @@ const largeGroupPayload = context.buildPayload(largeGroupState);
 assert.equal(largeGroupPayload.summary.participantCount, 100);
 assert.equal(largeGroupPayload.participants.length, 9, "charts should use top 8 participants plus Others");
 assert.equal(largeGroupPayload.participants.at(-1), "其他");
-assert.equal(largeGroupPayload.people.length, 80, "people table should be capped for large groups");
+assert.equal(largeGroupPayload.people.length, 100, "people table payload should include all aggregated participants");
+assert.equal(largeGroupPayload.conversationMode, "group", "100 participants should be group mode");
+assert.equal(largeGroupPayload.groupMetrics.activeParticipantCount, 100);
+assert.ok(largeGroupPayload.groupMetrics.topThreeShare > 0, "group metrics should include top-three share");
 assert.ok(
   largeGroupPayload.dailyTimeline.some((entry) => entry.byParticipant["其他"] > 0),
   "daily timeline should aggregate non-top participants into Others",
 );
 assert.equal(largeGroupPayload.messageMix.length, 24, "message mix should be capped to top language participants");
+assert.equal(
+  largeGroupPayload.presentationLimits.personalWordStatsComputedFor,
+  24,
+  "personal word stats limit should be disclosed",
+);
 
 console.log("large group payload cap tests passed");
+
+// --- Conversation mode, session threshold, reply/restart separation tests ---
+
+function buildPayloadFromMessages(messages) {
+  const localState = context.createState();
+  for (const message of messages) {
+    context.processMessageObject(message, localState);
+  }
+  context.finalizeState(localState);
+  return context.buildPayload(localState);
+}
+
+assert.equal(
+  buildPayloadFromMessages([
+    { type: "message", date: "2025-01-01T10:00:00", from: "A", text: "x" },
+  ]).conversationMode,
+  "single",
+);
+assert.equal(
+  buildPayloadFromMessages([
+    { type: "message", date: "2025-01-01T10:00:00", from: "A", text: "x" },
+    { type: "message", date: "2025-01-01T10:01:00", from: "B", text: "x" },
+  ]).conversationMode,
+  "direct",
+);
+assert.equal(
+  buildPayloadFromMessages([
+    { type: "message", date: "2025-01-01T10:00:00", from: "A", text: "x" },
+    { type: "message", date: "2025-01-01T10:01:00", from: "B", text: "x" },
+    { type: "message", date: "2025-01-01T10:02:00", from: "C", text: "x" },
+  ]).conversationMode,
+  "group",
+);
+
+const thresholdPayload = buildPayloadFromMessages([
+  { type: "message", date: "2025-01-01T10:00:00", from: "A", text: "x" },
+  { type: "message", date: "2025-01-01T10:05:00", from: "B", text: "x" },
+  { type: "message", date: "2025-01-01T12:00:00", from: "A", text: "restart" },
+  { type: "message", date: "2025-01-02T12:00:00", from: "B", text: "restart again" },
+]);
+const tenMinuteMetrics = thresholdPayload.sessionMetricsByThreshold[String(10 * 60_000)];
+const sixHourMetrics = thresholdPayload.sessionMetricsByThreshold[String(6 * 60 * 60_000)];
+assert.equal(tenMinuteMetrics.turnSwitchCount, 1, "only same-session speaker switch should count as reply");
+assert.equal(tenMinuteMetrics.restartCount, 2, "long gaps should become restarts");
+assert.equal(
+  tenMinuteMetrics.replyBuckets.at(-1),
+  0,
+  ">1d should no longer be used for reply delays beyond the session threshold",
+);
+assert.equal(sixHourMetrics.restartCount, 1, "larger threshold should reduce restart count");
+assert.equal(tenMinuteMetrics.restartInitiators[0].name, "A", "restart initiator should be next message sender");
+
+console.log("conversation mode + reply/restart tests passed");
+
+// --- Validation tests ---
+
+assert.equal(context.validateTelegramExport("").code, "EMPTY_FILE");
+assert.equal(context.validateTelegramExport("{").code, "TRUNCATED_JSON");
+assert.equal(context.validateTelegramExport("{not json}").code, "INVALID_JSON");
+assert.equal(context.validateTelegramExport({ name: "Chat" }).code, "MESSAGES_MISSING");
+assert.equal(context.validateTelegramExport({ messages: {} }).code, "MESSAGES_NOT_ARRAY");
+assert.equal(context.validateTelegramExport({ messages: [] }).code, "EMPTY_MESSAGES");
+assert.equal(
+  context.validateTelegramExport({ chats: { list: [] } }).code,
+  "POSSIBLE_FULL_ACCOUNT_EXPORT",
+);
+assert.equal(
+  context.validateTelegramExport({ messages: [{ type: "message" }] }).valid,
+  true,
+);
+
+console.log("validation tests passed");
+
+// --- Tokenization and phrase scoring tests ---
+
+const dictionaryState = context.createState({ customDictionary: ["Cloudflare Worker", "<b>危險</b>"] });
+context.processMessageObject(
+  {
+    type: "message",
+    date: "2025-02-01T10:00:00",
+    from: "A",
+    text: "Cloudflare Worker 真的很適合這個專案 哈哈",
+  },
+  dictionaryState,
+);
+context.processMessageObject(
+  {
+    type: "message",
+    date: "2025-02-02T10:00:00",
+    from: "A",
+    text: "我覺得先保守一點，我覺得先保守一點",
+  },
+  dictionaryState,
+);
+context.processMessageObject(
+  {
+    type: "message",
+    date: "2025-02-03T10:00:00",
+    from: "A",
+    text: "我覺得先保守一點",
+  },
+  dictionaryState,
+);
+context.processMessageObject(
+  {
+    type: "message",
+    date: "2025-02-04T10:00:00",
+    from: "A",
+    text: "我覺得先保守一點",
+  },
+  dictionaryState,
+);
+context.processMessageObject(
+  { type: "message", date: "2025-02-05T10:00:00", from: "A", text: "語氣 哈哈" },
+  dictionaryState,
+);
+context.processMessageObject(
+  {
+    type: "message",
+    date: "2025-02-06T10:00:00",
+    from: "A",
+    text: "我覺得先保守一點",
+  },
+  dictionaryState,
+);
+context.processMessageObject(
+  {
+    type: "message",
+    date: "2025-02-07T10:00:00",
+    from: "A",
+    text: "我覺得先保守一點",
+  },
+  dictionaryState,
+);
+context.processMessageObject(
+  {
+    type: "message",
+    date: "2025-02-08T10:00:00",
+    from: "A",
+    text: "我覺得先保守一點",
+  },
+  dictionaryState,
+);
+context.finalizeState(dictionaryState);
+const dictionaryPayload = context.buildPayload(dictionaryState);
+assert.equal(dictionaryPayload.wordAnalysisMeta.customDictionaryCount, 2);
+assert.ok(
+  dictionaryPayload.topTerms.some((entry) => entry.term === "Cloudflare Worker"),
+  "custom dictionary terms should be included",
+);
+assert.ok(
+  dictionaryPayload.catchphrases[0].topPhrases.some((entry) =>
+    entry.term.includes("我覺得先保守一點") &&
+    entry.totalCount >= 3 &&
+    entry.activeDayCount >= 2
+  ),
+  "phrase candidates should require repeated messages and days",
+);
+assert.ok(
+  dictionaryPayload.catchphrases[0].toneMarkers.some((entry) => entry.term === "哈哈"),
+  "tone markers should be preserved separately",
+);
+
+console.log("tokenization + phrase tests passed");
+
+// --- Large data precision tests ---
+
+const exactQuantiles = context.createQuantileAccumulator();
+for (let index = 1; index <= 100; index += 1) {
+  context.addQuantileValue(exactQuantiles, index * 1000);
+}
+assert.equal(exactQuantiles.mode, "exact");
+assert.equal(context.getQuantileValue(exactQuantiles, 0.5), 50_000);
+
+const approximateQuantiles = context.createQuantileAccumulator();
+for (let index = 0; index < 50_050; index += 1) {
+  context.addQuantileValue(approximateQuantiles, 60_000);
+}
+assert.equal(approximateQuantiles.mode, "approximate");
+assert.ok(
+  Math.abs(context.getQuantileValue(approximateQuantiles, 0.5) - 60_000) <= 1000,
+  "histogram approximation should remain close for uniform data",
+);
+
+console.log("large data precision tests passed");
 
 // --- Message type, reaction, calls, rich text, and injection-shaped text tests ---
 
@@ -353,6 +546,15 @@ context.processMessageObject(
   },
   mixedState,
 );
+context.processMessageObject(
+  {
+    type: "service",
+    action: "phone_call",
+    date: "2025-12-24T11:05:00",
+    actor: "B",
+  },
+  mixedState,
+);
 
 context.finalizeState(mixedState);
 const mixedPayload = context.buildPayload(mixedState);
@@ -362,8 +564,11 @@ assert.equal(mixedPayload.summary.linkedMessages, 1, "text_link entities should 
 assert.equal(mixedPayload.summary.reactedMessages, 1, "message with reactions should be counted once");
 assert.equal(mixedPayload.summary.totalReactionCount, 3, "reaction counts should be summed");
 assert.equal(mixedPayload.topReactions[0].count, 2, "emoji reactions should be reported");
-assert.equal(mixedPayload.calls.total, 1, "phone_call service event should be reported");
+assert.equal(mixedPayload.calls.total, 2, "phone_call service events should be reported");
 assert.equal(mixedPayload.calls.connected, 1, "positive duration calls should count as connected");
+assert.equal(mixedPayload.calls.callsWithDuration, 1, "missing duration should not be counted as zero-second duration");
+assert.equal(mixedPayload.calls.callsWithoutDuration, 1);
+assert.equal(mixedPayload.calls.avgDurationLabel, "2 分 5 秒", "average duration should exclude missing duration");
 assert.ok(
   mixedPayload.messageMix.some((person) =>
     person.categories.some((category) => category.label === "貼圖" && category.count === 1),

@@ -12,6 +12,14 @@ const conversationSummary = document.querySelector("#conversation-summary");
 const clearAnalysisButton = document.querySelector("#clear-analysis");
 const reselectFileButton = document.querySelector("#reselect-file");
 const analysisLive = document.querySelector("#analysis-live");
+const conversationModeBadge = document.querySelector("#conversation-mode-badge");
+const sessionThresholdSelect = document.querySelector("#session-threshold-select");
+const trendTopNSelect = document.querySelector("#trend-topn-select");
+const precisionBadge = document.querySelector("#precision-badge");
+const tokenizerBadge = document.querySelector("#tokenizer-badge");
+const customDictionaryInput = document.querySelector("#custom-dictionary");
+const applyDictionaryButton = document.querySelector("#apply-dictionary");
+const clearDictionaryButton = document.querySelector("#clear-dictionary");
 const summaryGrid = document.querySelector("#summary-grid");
 const insightsGrid = document.querySelector("#insights-grid");
 const timelineChart = document.querySelector("#timeline-chart");
@@ -46,7 +54,19 @@ let analysisWorker = null;
 let isAnalyzing = false;
 let lastDialogTrigger = null;
 let currentPayload = null;
+let currentSessionThreshold = null;
+let currentTrendTopN = 8;
+let peopleState = {
+  search: "",
+  sortKey: "messages",
+  sortDirection: "desc",
+  page: 1,
+  pageSize: 25,
+};
+const CUSTOM_DICTIONARY_KEY = "tg-chat-footprint.customDictionary";
 const PARTICIPANT_COLORS = ["#14b8a6", "#3b82f6", "#8b5cf6", "#f59e0b", "#22c55e", "#ef4444", "#06b6d4", "#64748b", "#94a3b8"];
+
+customDictionaryInput.value = loadCustomDictionary();
 
 initializeNavigation();
 initializeGuideDialog();
@@ -95,6 +115,33 @@ dropzone.addEventListener("keydown", (event) => {
 clearAnalysisButton.addEventListener("click", clearAnalysis);
 reselectFileButton.addEventListener("click", () => {
   fileInput.click();
+});
+
+sessionThresholdSelect.addEventListener("change", () => {
+  currentSessionThreshold = Number(sessionThresholdSelect.value);
+  renderThresholdDependentViews();
+});
+
+trendTopNSelect.addEventListener("change", () => {
+  currentTrendTopN = Number(trendTopNSelect.value);
+  renderTrendViews();
+});
+
+applyDictionaryButton.addEventListener("click", () => {
+  const dictionary = normalizeDictionaryText(customDictionaryInput.value).join("\n");
+  customDictionaryInput.value = dictionary;
+  saveCustomDictionary(dictionary);
+  if (currentFile && !isAnalyzing) {
+    handleFile(currentFile);
+  }
+});
+
+clearDictionaryButton.addEventListener("click", () => {
+  customDictionaryInput.value = "";
+  saveCustomDictionary("");
+  if (currentFile && !isAnalyzing) {
+    handleFile(currentFile);
+  }
 });
 
 function createAnalysisWorker() {
@@ -159,7 +206,13 @@ function handleFile(file) {
   fileSize.textContent = formatBytes(file.size);
   fileMeta.textContent = "背景分析中，請保持此頁開啟。";
   analysisLive.textContent = "已開始分析檔案。";
-  analysisWorker.postMessage({ type: "analyze", file });
+  analysisWorker.postMessage({
+    type: "analyze",
+    file,
+    options: {
+      customDictionary: normalizeDictionaryText(customDictionaryInput.value),
+    },
+  });
 }
 
 function setProgress(value) {
@@ -170,13 +223,14 @@ function setProgress(value) {
 
 function renderDashboard(payload) {
   currentPayload = payload;
+  currentSessionThreshold = currentSessionThreshold || payload.selectedSessionThreshold || Number(Object.keys(payload.sessionMetricsByThreshold || {})[0]);
+  currentTrendTopN = payload.presentationLimits?.trendTopNDefault || currentTrendTopN;
+  trendTopNSelect.value = String(currentTrendTopN);
+  renderAnalysisControls(payload);
   renderDatasetStrip(payload);
-  renderSummary(payload.summary);
-  renderInsights(payload.insights);
-  renderTimeline(payload.timeline, payload.participants);
-  renderDailyTimeline(payload.dailyTimeline, payload.participants);
+  renderThresholdDependentViews();
+  renderTrendViews();
   renderHeatmap(payload.heatmap);
-  renderReplyHistogram(payload.replyHistogram);
   renderTopDays(payload.topDays);
   renderTerms(payload.topTerms);
   renderCatchphrases(payload.catchphrases);
@@ -187,12 +241,128 @@ function renderDashboard(payload) {
   renderPeople(payload.people, payload.participantDisplay);
 }
 
+function renderAnalysisControls(payload) {
+  conversationModeBadge.textContent = getConversationModeLabel(payload.conversationMode);
+  sessionThresholdSelect.innerHTML = (payload.sessionThresholdOptions || [])
+    .map((option) => `<option value="${option.value}">${escapeHtml(option.label)}</option>`)
+    .join("");
+  sessionThresholdSelect.value = String(currentSessionThreshold || payload.selectedSessionThreshold);
+  precisionBadge.textContent = getPrecisionLabel(payload.analysisPrecision?.replyMedian);
+  tokenizerBadge.textContent = payload.wordAnalysisMeta
+    ? `${payload.wordAnalysisMeta.tokenizer === "intl-segmenter" ? "原生斷詞" : "fallback 斷詞"} · ${payload.wordAnalysisMeta.customDictionaryCount} 個自訂詞`
+    : "斷詞";
+}
+
+function renderThresholdDependentViews() {
+  if (!currentPayload) {
+    return;
+  }
+  const metrics = getSelectedSessionMetrics();
+  const summary = buildSummaryForThreshold(currentPayload.summary, metrics);
+  renderSummary(summary, currentPayload.groupMetrics);
+  renderInsights(buildInsightsForThreshold(currentPayload.insights, metrics, currentPayload));
+  renderReplyHistogram(buildReplyHistogramForThreshold(metrics));
+  precisionBadge.textContent = getPrecisionLabel(metrics?.precision?.replyMedian);
+}
+
+function renderTrendViews() {
+  if (!currentPayload) {
+    return;
+  }
+  const view = currentPayload.trendViewsByTopN?.[String(currentTrendTopN)] || {
+    participants: currentPayload.participants,
+    timeline: currentPayload.timeline,
+    dailyTimeline: currentPayload.dailyTimeline,
+  };
+  renderTimeline(view.timeline, view.participants);
+  renderDailyTimeline(view.dailyTimeline, view.participants);
+}
+
 function renderDatasetStrip(payload) {
   const { summary } = payload;
   const firstDate = getFirstTimelineDate(payload);
   const lastDate = getLastTimelineDate(payload);
   const fileLabel = currentFile ? currentFile.name : "Telegram 對話";
-  conversationSummary.textContent = `${fileLabel} • ${summary.totalMessages.toLocaleString()} 則訊息 • ${summary.participantCount.toLocaleString()} 位參與者 • ${firstDate} 到 ${lastDate}`;
+  conversationSummary.textContent = `${fileLabel} • ${getConversationModeLabel(payload.conversationMode)} • ${summary.totalMessages.toLocaleString()} 則訊息 • ${summary.participantCount.toLocaleString()} 位參與者 • ${firstDate} 到 ${lastDate}`;
+}
+
+function getSelectedSessionMetrics() {
+  const metricsByThreshold = currentPayload?.sessionMetricsByThreshold || {};
+  const key = String(currentSessionThreshold || currentPayload?.selectedSessionThreshold || "");
+  return metricsByThreshold[key] || Object.values(metricsByThreshold)[0] || null;
+}
+
+function buildSummaryForThreshold(summary, metrics) {
+  if (!metrics) {
+    return summary;
+  }
+  return {
+    ...summary,
+    immediateReplyLabel: metrics.replyP90 === null ? "暫無" : formatDuration(metrics.replyP90),
+    immediateReplyMeta: metrics.turnSwitchCount
+      ? `${metrics.quickReplyCount.toLocaleString()} 次 ${metrics.quickReplyThresholdLabel}內接話；回覆速度僅計算同一段對話內的換人接話`
+      : "目前還沒有足夠的短間隔回覆",
+    restartReplyLabel: metrics.restartMedian === null ? "暫無" : formatDuration(metrics.restartMedian),
+    restartReplyMeta: metrics.restartCount
+      ? `以 ${metrics.thresholdLabel} 作為對話斷點，${metrics.restartCount.toLocaleString()} 次重啟間隔的中位數`
+      : "目前還沒有足夠的重啟對話",
+  };
+}
+
+function buildInsightsForThreshold(baseInsights, metrics, payload) {
+  if (!metrics) {
+    return baseInsights;
+  }
+  return {
+    ...baseInsights,
+    stickiness: {
+      label: metrics.turnSwitchCount
+        ? `${((metrics.quickReplyCount / metrics.turnSwitchCount) * 100).toFixed(1)}%`
+        : "暫無",
+      meta: metrics.turnSwitchCount
+        ? `${metrics.quickReplyCount.toLocaleString()} / ${metrics.turnSwitchCount.toLocaleString()} 次輪流回覆在 ${metrics.quickReplyThresholdLabel}內接上`
+        : "目前還沒有足夠的輪流回覆資料",
+    },
+    restartFrequency: {
+      label: metrics.restartCount && payload.summary.spanDays
+        ? `${(metrics.restartCount / Math.max(payload.summary.spanDays / 7, 1)).toFixed(1)} 次/週`
+        : "暫無",
+      meta: metrics.restartCount
+        ? `以 ${metrics.thresholdLabel} 作為對話斷點，共 ${metrics.restartCount.toLocaleString()} 次重啟`
+        : "目前還沒有足夠的重啟對話資料",
+    },
+  };
+}
+
+function buildReplyHistogramForThreshold(metrics) {
+  if (!metrics) {
+    return { bins: [] };
+  }
+  return {
+    bins: metrics.replyBuckets.map((count, index) => ({
+      label: ["0-5s", "5-20s", "20-60s", "1-5m", "5-30m", "30m-6h", "6h-1d", ">1d"][index],
+      count,
+    })),
+    precision: metrics.precision?.replyMedian,
+    longestGapLabel: metrics.longestSilence ? formatDuration(metrics.longestSilence.duration) : "暫無",
+    longestGapRange: metrics.longestSilence
+      ? `${formatShortDate(metrics.longestSilence.from)} → ${formatShortDate(metrics.longestSilence.to)}`
+      : "目前資料還不夠",
+  };
+}
+
+function getConversationModeLabel(mode) {
+  if (mode === "group") {
+    return "群組";
+  }
+  if (mode === "single") {
+    return "單人／特殊對話";
+  }
+  return "一對一";
+}
+
+function getPrecisionLabel(value) {
+  return value === "approximate" ? "大型資料近似" : "精確";
 }
 
 function renderInsights(insights) {
@@ -258,13 +428,6 @@ function renderInsights(insights) {
       `,
     )
     .join("");
-}
-
-function collapseGuide() {
-  guideContent.classList.add("hidden");
-  guidePanel.classList.add("is-collapsed");
-  guideToggle.setAttribute("aria-expanded", "false");
-  guideToggle.textContent = "看匯出教學";
 }
 
 function scrollDashboardIntoView() {
@@ -381,6 +544,14 @@ function setActiveSection(sectionId) {
 function clearRenderedResults() {
   dailyTimelineState = null;
   currentPayload = null;
+  currentSessionThreshold = null;
+  peopleState = {
+    search: "",
+    sortKey: "messages",
+    sortDirection: "desc",
+    page: 1,
+    pageSize: 25,
+  };
   summaryGrid.innerHTML = "";
   insightsGrid.innerHTML = "";
   timelineChart.innerHTML = "";
@@ -396,6 +567,9 @@ function clearRenderedResults() {
   signalsPanel.innerHTML = "";
   reactionsPanel.innerHTML = "";
   peopleTable.innerHTML = "";
+  conversationModeBadge.textContent = "—";
+  precisionBadge.textContent = "精確";
+  tokenizerBadge.textContent = "斷詞";
 }
 
 function clearAnalysis() {
@@ -463,7 +637,7 @@ function getLastTimelineDate(payload = currentPayload) {
   return entries.length ? entries[entries.length - 1].label : "—";
 }
 
-function renderSummary(summary) {
+function renderSummary(summary, groupMetrics = null) {
   summaryGrid.innerHTML = "";
   const firstDate = getFirstTimelineDate();
   const lastDate = getLastTimelineDate();
@@ -506,7 +680,7 @@ function renderSummary(summary) {
     },
     {
       icon: "⚖",
-      label: "發話平衡",
+      label: summary.conversationMode === "group" ? "發言集中度" : "發話平衡",
       value: summary.balanceLabel,
       meta: summary.balanceMeta,
     },
@@ -523,6 +697,23 @@ function renderSummary(summary) {
       meta: summary.restartReplyMeta,
     },
   ];
+
+  if (summary.conversationMode === "group" && groupMetrics) {
+    cards.push(
+      {
+        icon: "◎",
+        label: "活躍參與者",
+        value: groupMetrics.activeParticipantCount.toLocaleString(),
+        meta: `訊息數中位數 ${groupMetrics.medianMessagesPerParticipant.toLocaleString()} 則`,
+      },
+      {
+        icon: "▥",
+        label: "Top 1 占比",
+        value: groupMetrics.topParticipantShareLabel,
+        meta: `前三位合計 ${groupMetrics.topThreeShareLabel}`,
+      },
+    );
+  }
 
   for (const card of cards) {
     const fragment = summaryCardTemplate.content.cloneNode(true);
@@ -986,15 +1177,25 @@ function renderPeople(people, participantDisplay) {
     return;
   }
 
+  const query = peopleState.search.trim().toLowerCase();
+  const filtered = people.filter((person) => person.name.toLowerCase().includes(query));
+  const sorted = [...filtered].sort((left, right) => comparePeople(left, right));
+  const pageCount = Math.max(1, Math.ceil(sorted.length / peopleState.pageSize));
+  peopleState.page = Math.min(peopleState.page, pageCount);
+  const pageStart = (peopleState.page - 1) * peopleState.pageSize;
+  const pageRows = sorted.slice(pageStart, pageStart + peopleState.pageSize);
   const maxMessages = Math.max(...people.map((person) => person.messages), 1);
-  const limitNotice =
-    participantDisplay && participantDisplay.total > people.length
-      ? `<div class="table-note">大型群組模式：以下顯示訊息數前 ${people.length.toLocaleString()} 位，全部共有 ${participantDisplay.total.toLocaleString()} 位參與者。</div>`
-      : "";
+  const limitNotice = participantDisplay
+    ? `<div class="table-note">完整參與者資料共 ${participantDisplay.total.toLocaleString()} 位，可搜尋、排序與分頁；圖表預設顯示 Top ${participantDisplay.timelineLimit} 加上「其他」。</div>`
+    : "";
   peopleTable.innerHTML = [
     limitNotice,
-    `<div class="table-row table-row-wide header"><div>參與者</div><div>訊息數</div><div>平均字數</div><div>媒體訊息占比</div><div>互動線索</div></div>`,
-    ...people.map((person) => {
+    `<div class="people-toolbar">
+      <label><span class="sr-only">搜尋參與者</span><input id="people-search" type="search" value="${escapeAttribute(peopleState.search)}" placeholder="搜尋姓名" /></label>
+      <label><span>每頁</span><select id="people-page-size"><option value="25"${peopleState.pageSize === 25 ? " selected" : ""}>25</option><option value="50"${peopleState.pageSize === 50 ? " selected" : ""}>50</option></select></label>
+    </div>`,
+    `<div class="table-row table-row-wide header"><button type="button" data-sort="name">參與者</button><button type="button" data-sort="messages">訊息數</button><button type="button" data-sort="avgChars">平均字數</button><button type="button" data-sort="mediaShare">媒體訊息占比</button><div>互動線索</div></div>`,
+    ...pageRows.map((person) => {
       const share = ((person.messages / maxMessages) * 100).toFixed(1);
       const topReactionLine = person.reactionsReceived.length
         ? `收到表情反應: ${person.reactionCountReceived.toLocaleString()} 次\n最常見的是: ${person.reactionsReceived
@@ -1011,8 +1212,58 @@ function renderPeople(people, participantDisplay) {
       ].join(" / ");
       return `<div class="table-row table-row-wide has-tooltip" data-tooltip="${escapeAttribute(tooltip)}"><div class="table-cell"><strong>${escapeHtml(person.name)}</strong><span class="table-muted">${person.characters.toLocaleString()} 字元</span></div><div class="table-cell"><strong>${person.messages.toLocaleString()}</strong><div class="mini-bar"><span style="width:${share}%"></span></div></div><div class="table-cell">${person.avgChars.toFixed(1)}</div><div class="table-cell">${person.mediaShare}%</div><div class="table-cell">${signalSummary}</div></div>`;
     }),
+    `<div class="pagination">
+      <button class="button button-ghost" type="button" id="people-prev" ${peopleState.page <= 1 ? "disabled" : ""}>上一頁</button>
+      <span>第 ${peopleState.page.toLocaleString()} / ${pageCount.toLocaleString()} 頁，符合 ${filtered.length.toLocaleString()} 位</span>
+      <button class="button button-ghost" type="button" id="people-next" ${peopleState.page >= pageCount ? "disabled" : ""}>下一頁</button>
+    </div>`,
   ].join("");
+  bindPeopleControls(people, participantDisplay);
   bindTooltips(peopleTable);
+}
+
+function comparePeople(left, right) {
+  const direction = peopleState.sortDirection === "asc" ? 1 : -1;
+  if (peopleState.sortKey === "name") {
+    return left.name.localeCompare(right.name) * direction;
+  }
+  const leftValue = Number(left[peopleState.sortKey]) || 0;
+  const rightValue = Number(right[peopleState.sortKey]) || 0;
+  return (leftValue - rightValue) * direction;
+}
+
+function bindPeopleControls(people, participantDisplay) {
+  peopleTable.querySelector("#people-search")?.addEventListener("input", (event) => {
+    peopleState.search = event.target.value;
+    peopleState.page = 1;
+    renderPeople(people, participantDisplay);
+  });
+  peopleTable.querySelector("#people-page-size")?.addEventListener("change", (event) => {
+    peopleState.pageSize = Number(event.target.value);
+    peopleState.page = 1;
+    renderPeople(people, participantDisplay);
+  });
+  peopleTable.querySelector("#people-prev")?.addEventListener("click", () => {
+    peopleState.page -= 1;
+    renderPeople(people, participantDisplay);
+  });
+  peopleTable.querySelector("#people-next")?.addEventListener("click", () => {
+    peopleState.page += 1;
+    renderPeople(people, participantDisplay);
+  });
+  peopleTable.querySelectorAll("[data-sort]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const key = button.dataset.sort;
+      if (peopleState.sortKey === key) {
+        peopleState.sortDirection = peopleState.sortDirection === "asc" ? "desc" : "asc";
+      } else {
+        peopleState.sortKey = key;
+        peopleState.sortDirection = key === "name" ? "asc" : "desc";
+      }
+      peopleState.page = 1;
+      renderPeople(people, participantDisplay);
+    });
+  });
 }
 
 function renderCatchphrases(catchphrases) {
@@ -1106,12 +1357,17 @@ function renderCalls(calls) {
     {
       label: "通話次數",
       value: calls.total.toLocaleString(),
-      meta: `${calls.connected.toLocaleString()} 次有接起來`,
+      meta: `${calls.callsWithDuration.toLocaleString()} 次有時長，${calls.callsWithoutDuration.toLocaleString()} 次缺少時長`,
     },
     {
       label: "總通話時長",
       value: calls.totalDurationLabel,
-      meta: `平均每次 ${calls.avgDurationLabel}`,
+      meta: `平均每次 ${calls.avgDurationLabel}（只除以有時長的通話）`,
+    },
+    {
+      label: "資料完整度",
+      value: calls.durationCompletenessLabel,
+      meta: `${calls.callsWithResult.toLocaleString()} 次有結果欄位，${calls.callsWithoutResult.toLocaleString()} 次缺少結果`,
     },
     {
       label: "最常打的人",
@@ -1233,6 +1489,73 @@ function formatShare(part, total) {
     return "0.0%";
   }
   return `${((part / total) * 100).toFixed(1)}%`;
+}
+
+function formatDuration(ms) {
+  if (!Number.isFinite(ms) || ms < 0) {
+    return "暫無";
+  }
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) {
+    return `${seconds} 秒`;
+  }
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes} 分鐘`;
+  }
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) {
+    return `${hours} 小時`;
+  }
+  const days = Math.round(hours / 24);
+  return `${days} 天`;
+}
+
+function formatShortDate(timestamp) {
+  if (!Number.isFinite(timestamp)) {
+    return "—";
+  }
+  return new Date(timestamp).toLocaleDateString("zh-Hant", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function normalizeDictionaryText(value) {
+  const seen = new Set();
+  return String(value || "")
+    .split(/\r?\n/u)
+    .map((entry) => entry.trim().replace(/\s+/gu, " "))
+    .filter((entry) => {
+      if (!entry || entry.length > 40 || seen.has(entry)) {
+        return false;
+      }
+      seen.add(entry);
+      return true;
+    })
+    .slice(0, 100);
+}
+
+function loadCustomDictionary() {
+  try {
+    return localStorage.getItem(CUSTOM_DICTIONARY_KEY) || "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+function saveCustomDictionary(value) {
+  try {
+    if (value) {
+      localStorage.setItem(CUSTOM_DICTIONARY_KEY, value);
+    } else {
+      localStorage.removeItem(CUSTOM_DICTIONARY_KEY);
+    }
+  } catch (_error) {
+    // Storage may be disabled; dictionary still works for the current page.
+  }
 }
 
 function safeDisplay(value) {

@@ -18,11 +18,83 @@ const REPLY_BUCKET_LABELS = [
   "6h-1d",
   ">1d",
 ];
-const SESSION_THRESHOLD_FALLBACK_MS = 30 * 60_000;
+const DEFAULT_SESSION_THRESHOLD_MS = 30 * 60_000;
+const SESSION_THRESHOLD_FALLBACK_MS = DEFAULT_SESSION_THRESHOLD_MS;
 const SESSION_THRESHOLD_MIN_MS = 10 * 60_000;
 const SESSION_THRESHOLD_MAX_MS = 24 * 60 * 60_000;
+const SESSION_THRESHOLDS_MS = [
+  10 * 60_000,
+  DEFAULT_SESSION_THRESHOLD_MS,
+  60 * 60_000,
+  6 * 60 * 60_000,
+];
 const QUICK_REPLY_MAX_MS = 60 * 60_000;
+const WORD_CATEGORIES = {
+  grammaticalStopwords: [
+    "the",
+    "and",
+    "for",
+    "that",
+    "this",
+    "with",
+    "you",
+    "are",
+    "was",
+    "have",
+    "just",
+    "from",
+    "https",
+    "http",
+    "www",
+    "com",
+    "我",
+    "你",
+    "他",
+    "她",
+    "它",
+    "我們",
+    "你們",
+    "他們",
+    "的",
+    "了",
+    "是",
+    "就",
+    "也",
+    "在",
+    "有",
+    "很",
+    "嗎",
+    "可以",
+    "不是",
+    "一個",
+    "和",
+    "與",
+    "這",
+    "那",
+  ],
+  fillers: ["嗯", "呃", "欸", "喔", "哦", "啊", "啦", "吧", "嘛", "呢", "呀"],
+  laughter: ["哈哈", "哈哈哈", "lol", "xd"],
+  emotionMarkers: ["嗚嗚", "哭", "笑死", "傻眼"],
+};
+const GRAMMATICAL_STOPWORDS = new Set(WORD_CATEGORIES.grammaticalStopwords);
 const STOPWORDS = new Set([
+  ...WORD_CATEGORIES.grammaticalStopwords,
+  ...WORD_CATEGORIES.fillers,
+  ...WORD_CATEGORIES.laughter,
+  ...WORD_CATEGORIES.emotionMarkers,
+]);
+/*
+ * General word clouds exclude grammatical stopwords. Fillers, laughter, and
+ * emotion markers remain available as conversational tone signals so they are
+ * not silently erased from per-participant language summaries.
+ */
+const GENERAL_WORD_EXCLUSIONS = GRAMMATICAL_STOPWORDS;
+const TONE_MARKERS = new Set([
+  ...WORD_CATEGORIES.fillers,
+  ...WORD_CATEGORIES.laughter,
+  ...WORD_CATEGORIES.emotionMarkers,
+]);
+const LEGACY_STOPWORDS = new Set([
   "the",
   "and",
   "for",
@@ -128,11 +200,16 @@ const MESSAGE_TYPE_LABELS = {
   other: "其他",
 };
 const QUANTILE_SAMPLE_LIMIT = 20_000;
+const EXACT_QUANTILE_LIMIT = 50_000;
+const TIMELINE_TOP_N_OPTIONS = [5, 8, 12, 20];
 const TIMELINE_PARTICIPANT_LIMIT = 8;
-const PEOPLE_LIMIT = 80;
 const LANGUAGE_PARTICIPANT_LIMIT = 24;
 const LANGUAGE_MIN_MESSAGES = 5;
 const REPLY_ASYMMETRY_PARTICIPANT_LIMIT = 12;
+const GROUP_CONCENTRATION_THRESHOLDS = {
+  low: 0.4,
+  high: 0.7,
+};
 
 self.addEventListener("message", async ({ data }) => {
   if (data.type !== "analyze") {
@@ -140,7 +217,7 @@ self.addEventListener("message", async ({ data }) => {
   }
 
   try {
-    const payload = await analyzeFile(data.file);
+    const payload = await analyzeFile(data.file, data.options || {});
     self.postMessage({ type: "result", payload });
   } catch (error) {
     self.postMessage({
@@ -150,8 +227,13 @@ self.addEventListener("message", async ({ data }) => {
   }
 });
 
-async function analyzeFile(file) {
-  const state = createState();
+async function analyzeFile(file, options = {}) {
+  const validation = validateTelegramExportFile(file);
+  if (!validation.valid) {
+    throw new Error(validation.message);
+  }
+
+  const state = createState(options);
   const reader = file.stream().getReader();
   const decoder = new TextDecoder();
   let bytesRead = 0;
@@ -178,13 +260,15 @@ async function analyzeFile(file) {
       const match = preamble.match(/"messages"\s*:\s*\[/);
       if (!match) {
         if (preamble.length > 200_000) {
-          throw new Error("這份檔案裡找不到 messages 陣列，可能不是 Telegram 匯出的 JSON 聊天檔。");
+          throw new Error(buildValidationResult("MESSAGES_MISSING", preamble).message);
         }
         sendProgress(bytesRead, file.size, processedMessages, "正在確認聊天檔格式");
         continue;
       }
 
       const startIndex = match.index + match[0].length;
+      state.telegramChatType = extractRootStringField(preamble, "type") || "unknown";
+      state.chatName = extractRootStringField(preamble, "name") || extractRootStringField(preamble, "title") || "";
       text = preamble.slice(startIndex);
       preamble = "";
       foundMessages = true;
@@ -235,7 +319,14 @@ async function analyzeFile(file) {
         depth -= 1;
         if (depth === 0) {
           processedMessages += 1;
-          processMessageObject(JSON.parse(currentObject), state);
+          try {
+            processMessageObject(JSON.parse(currentObject), state);
+          } catch (error) {
+            if (error instanceof SyntaxError) {
+              throw new Error(buildValidationResult("INVALID_JSON").message);
+            }
+            throw error;
+          }
           currentObject = "";
         }
       }
@@ -249,16 +340,160 @@ async function analyzeFile(file) {
   }
 
   if (!foundMessages) {
-    throw new Error("這份檔案看起來不是可以分析的 Telegram 對話 JSON。");
+    throw new Error(buildValidationResult("MESSAGES_MISSING", preamble).message);
+  }
+
+  if (depth !== 0 || currentObject) {
+    throw new Error(buildValidationResult("TRUNCATED_JSON").message);
   }
 
   finalizeState(state);
   return buildPayload(state);
 }
 
-function createState() {
+function validateTelegramExport(input) {
+  if (input === null || input === undefined) {
+    return buildValidationResult("EMPTY_FILE");
+  }
+
+  if (typeof input === "string") {
+    if (!input.trim()) {
+      return buildValidationResult("EMPTY_FILE");
+    }
+
+    try {
+      return validateTelegramExport(JSON.parse(input));
+    } catch (error) {
+      const code = looksTruncatedJson(input) ? "TRUNCATED_JSON" : "INVALID_JSON";
+      return buildValidationResult(code, input);
+    }
+  }
+
+  if (typeof input !== "object") {
+    return buildValidationResult("UNSUPPORTED_EXPORT");
+  }
+
+  const detectedFormat = detectTelegramExportFormat(input);
+  if (!("messages" in input)) {
+    return buildValidationResult(
+      detectedFormat === "full-account-like" ? "POSSIBLE_FULL_ACCOUNT_EXPORT" : "MESSAGES_MISSING",
+      input,
+    );
+  }
+
+  if (!Array.isArray(input.messages)) {
+    return buildValidationResult("MESSAGES_NOT_ARRAY", input);
+  }
+
+  if (input.messages.length === 0) {
+    return buildValidationResult("EMPTY_MESSAGES", input);
+  }
+
   return {
+    valid: true,
+    code: "OK",
+    message: "可分析的 Telegram 對話 JSON。",
+    suggestions: [],
+    detectedFormat,
+  };
+}
+
+function validateTelegramExportFile(file) {
+  if (!file || typeof file.size !== "number" || file.size === 0) {
+    return buildValidationResult("EMPTY_FILE");
+  }
+  return {
+    valid: true,
+    code: "PENDING_STREAM_VALIDATION",
+    message: "等待串流檢查 Telegram 匯出內容。",
+    suggestions: [],
+    detectedFormat: "unknown",
+  };
+}
+
+function buildValidationResult(code, input = null) {
+  const detectedFormat = detectTelegramExportFormat(input);
+  const base = {
+    valid: false,
+    code,
+    detectedFormat,
+    suggestions: [
+      "請使用 Telegram Desktop 匯出單一對話。",
+      "匯出格式請選 JSON。",
+      "請選擇匯出資料夾中的 result.json，而不是 HTML 檔案。",
+    ],
+  };
+
+  const messages = {
+    EMPTY_FILE: "檔案是空的，請重新選擇 Telegram 匯出的 result.json。",
+    INVALID_JSON: "JSON 語法無法解析，請確認檔案未被修改且完整下載。",
+    MESSAGES_MISSING: "找不到 messages 陣列。請確認這是單一 Telegram 對話的 JSON 匯出檔。",
+    MESSAGES_NOT_ARRAY: "messages 欄位不是陣列，這份檔案不是目前可分析的 Telegram 對話格式。",
+    EMPTY_MESSAGES: "messages 陣列是空的，沒有可分析的訊息。",
+    UNSUPPORTED_EXPORT: "這份檔案不是目前支援的 Telegram 對話 JSON 結構。",
+    TRUNCATED_JSON: "JSON 看起來不完整，可能是匯出或複製過程中被截斷。",
+    POSSIBLE_FULL_ACCOUNT_EXPORT:
+      "偵測到多聊天或全帳號匯出格式。請改用 Telegram Desktop 匯出單一對話的 result.json。",
+  };
+
+  return {
+    ...base,
+    message: messages[code] || messages.UNSUPPORTED_EXPORT,
+  };
+}
+
+function detectTelegramExportFormat(input) {
+  if (!input) {
+    return "unknown";
+  }
+  if (typeof input === "string") {
+    if (/"messages"\s*:\s*\[/.test(input)) {
+      return "single-chat-like";
+    }
+    if (/"chats"\s*:|"_chat_map"\s*:|accounts?\s*:/i.test(input)) {
+      return "full-account-like";
+    }
+    return "unknown";
+  }
+  if (typeof input === "object") {
+    if (Array.isArray(input.messages)) {
+      return "single-chat";
+    }
+    if (input.chats || input._chat_map || input.account || input.accounts) {
+      return "full-account-like";
+    }
+  }
+  return "unknown";
+}
+
+function looksTruncatedJson(text) {
+  const trimmed = text.trim();
+  return Boolean(trimmed) && !/[}\]]\s*$/u.test(trimmed);
+}
+
+function extractRootStringField(preamble, key) {
+  const pattern = new RegExp(`"${key}"\\s*:\\s*"([^"]*)"`);
+  const match = preamble.match(pattern);
+  return match ? match[1] : "";
+}
+
+function createState(options = {}) {
+  const customDictionary = normalizeCustomDictionary(options.customDictionary);
+  const tokenizer = createTokenizer(customDictionary);
+  return {
+    options: {
+      customDictionary,
+    },
+    tokenizer,
+    wordAnalysisMeta: {
+      tokenizer: tokenizer.strategy,
+      locale: "zh-Hant",
+      customDictionaryCount: customDictionary.length,
+      analyzedTextMessageCount: 0,
+      rejectedTokenCount: 0,
+    },
     chatName: "",
+    telegramChatType: "unknown",
     totalMessages: 0,
     textMessages: 0,
     editedMessages: 0,
@@ -377,8 +612,9 @@ function processMessageObject(message, state) {
   state.heatmap[weekday][date.getHours()] += 1;
 
   if (hasText) {
-    updateHeavyTerms(state.heavyTerms, trimmedText);
-    updateParticipantLanguage(state.catchphraseStats, sender, trimmedText, person.messages);
+    state.wordAnalysisMeta.analyzedTextMessageCount += 1;
+    updateHeavyTerms(state, trimmedText);
+    updateParticipantLanguage(state, sender, trimmedText, person.messages, dayKey);
   }
 
   if (state.lastMessage) {
@@ -433,23 +669,17 @@ function resolveSender(message) {
 }
 
 function finalizeState(state) {
-  state.sessionThreshold = computeSessionThreshold(getQuantileSamples(state.messageGapStats));
+  state.sessionThreshold = DEFAULT_SESSION_THRESHOLD_MS;
   state.quickReplyThreshold = Math.min(state.sessionThreshold, QUICK_REPLY_MAX_MS);
-  state.immediateReplyDelays = getQuantileSamples(state.turnDelayStats).filter(
-    (delay) => delay < state.quickReplyThreshold,
+  state.sessionMetricsByThreshold = buildSessionMetricsByThreshold(
+    state.sequenceSenders,
+    state.sequenceTimestamps,
   );
-  state.immediateReplyCount = estimateSampledCount(
-    state.turnDelayStats,
-    state.immediateReplyDelays.length,
-  );
-  state.sessions = buildSessions(state.sequenceSenders, state.sequenceTimestamps, state.sessionThreshold);
-  state.sessionRestartIntervals = [];
-  for (let i = 1; i < state.sessions.length; i += 1) {
-    const gap = state.sessions[i].start - state.sessions[i - 1].end;
-    if (gap >= 0) {
-      state.sessionRestartIntervals.push(gap);
-    }
-  }
+  state.defaultSessionMetrics = state.sessionMetricsByThreshold[String(DEFAULT_SESSION_THRESHOLD_MS)];
+  state.sessions = state.defaultSessionMetrics.sessions;
+  state.sessionRestartIntervals = state.defaultSessionMetrics.restartIntervals;
+  state.immediateReplyCount = state.defaultSessionMetrics.quickReplyCount;
+  state.immediateReplyDelays = state.defaultSessionMetrics.replySamples;
 }
 
 function buildPayload(state) {
@@ -469,6 +699,8 @@ function buildPayload(state) {
     }))
     .sort((left, right) => right.messages - left.messages);
   const participantCount = participants.length;
+  const conversationMode = getConversationMode(participantCount);
+  const sessionMetrics = state.defaultSessionMetrics;
   const timelineParticipants = participants.slice(0, TIMELINE_PARTICIPANT_LIMIT);
   const timelineParticipantNames = timelineParticipants.map((participant) => participant.name);
   const timelineNamesWithOther =
@@ -498,15 +730,46 @@ function buildPayload(state) {
     name: participant.name,
     share: ((participant.messages / totalMessages) * 100).toFixed(1),
   }));
-  const immediateReply = quantile(state.immediateReplyDelays, 0.9);
-  const restartReply = quantile(state.sessionRestartIntervals, 0.5);
-  const quickLabel = formatThresholdLabel(state.quickReplyThreshold);
-  const sessionLabel = formatThresholdLabel(state.sessionThreshold);
+  const immediateReply = sessionMetrics.replyP90;
+  const restartReply = sessionMetrics.restartMedian;
+  const quickLabel = sessionMetrics.quickReplyThresholdLabel;
+  const sessionLabel = sessionMetrics.thresholdLabel;
+  const trendViewsByTopN = buildTrendViewsByTopN(state, participants);
+  const groupMetrics = buildGroupMetrics(participants, sessionMetrics);
+  const balance = conversationMode === "group"
+    ? buildGroupBalanceSummary(groupMetrics)
+    : {
+        label: buildBalanceLabel(topParticipants),
+        meta: buildBalanceMeta(topParticipants, participants.length),
+      };
 
   return {
+    conversationMode,
+    participantCount,
+    telegramChatType: state.telegramChatType,
+    chatName: state.chatName,
     participants: timelineNamesWithOther,
+    trendViewsByTopN,
+    selectedSessionThreshold: DEFAULT_SESSION_THRESHOLD_MS,
+    sessionThresholdOptions: SESSION_THRESHOLDS_MS.map((threshold) => ({
+      value: threshold,
+      label: formatThresholdLabel(threshold),
+    })),
+    sessionMetricsByThreshold: serializeSessionMetrics(state.sessionMetricsByThreshold),
+    groupMetrics,
+    analysisPrecision: sessionMetrics.precision,
+    wordAnalysisMeta: state.wordAnalysisMeta,
+    presentationLimits: {
+      trendTopNDefault: TIMELINE_PARTICIPANT_LIMIT,
+      trendTopNOptions: TIMELINE_TOP_N_OPTIONS,
+      participantTableTotal: participantCount,
+      personalWordStatsComputedFor: Math.min(LANGUAGE_PARTICIPANT_LIMIT, participantCount),
+      personalTypeStatsComputedFor: Math.min(LANGUAGE_PARTICIPANT_LIMIT, participantCount),
+    },
     summary: {
       totalMessages: state.totalMessages,
+      conversationMode,
+      telegramChatType: state.telegramChatType,
       participantCount,
       displayedParticipantCount: timelineNamesWithOther.length,
       textMessages: state.textMessages,
@@ -523,29 +786,28 @@ function buildPayload(state) {
       activeDensityMeta: spanDays
         ? `${activeDays.toLocaleString()} / ${spanDays.toLocaleString()} 天有對話`
         : "目前資料還不夠",
-      balanceLabel: buildBalanceLabel(topParticipants),
-      balanceMeta: buildBalanceMeta(topParticipants, participants.length),
+      balanceLabel: balance.label,
+      balanceMeta: balance.meta,
       immediateReplyLabel: immediateReply === null ? "暫無" : formatDuration(immediateReply),
-      immediateReplyMeta: state.immediateReplyCount
-        ? `${state.immediateReplyCount.toLocaleString()} 次 ${quickLabel}內接話的 p90`
+      immediateReplyMeta: sessionMetrics.turnSwitchCount
+        ? `${sessionMetrics.quickReplyCount.toLocaleString()} 次 ${quickLabel}內接話；回覆速度僅計算同一段對話內的換人接話`
         : "目前還沒有足夠的短間隔回覆",
       restartReplyLabel: restartReply === null ? "暫無" : formatDuration(restartReply),
-      restartReplyMeta: state.sessionRestartIntervals.length
-        ? `以 ${sessionLabel} 作為對話斷點，${state.sessionRestartIntervals.length.toLocaleString()} 次重啟間隔的中位數`
+      restartReplyMeta: sessionMetrics.restartCount
+        ? `以 ${sessionLabel} 作為對話斷點，${sessionMetrics.restartCount.toLocaleString()} 次重啟間隔的中位數`
         : "目前還沒有足夠的重啟對話",
     },
     insights: {
       activeHours: buildActiveHoursInsight(state.heatmap),
       burstiness: buildBurstinessInsight(dailyEntries),
-      stickiness: buildStickinessInsight(state.immediateReplyCount, state.turnSwitchCount, state.quickReplyThreshold),
-      restartFrequency: buildRestartFrequencyInsight(Math.max(0, state.sessions.length - 1), spanDays, state.sessionThreshold),
-      replyAsymmetry: buildReplyAsymmetryInsight(
-        state.sequenceSenders,
-        state.sequenceTimestamps,
-        state.quickReplyThreshold,
-        participants.slice(0, REPLY_ASYMMETRY_PARTICIPANT_LIMIT).map((participant) => participant.name),
-      ),
-      initiative: buildInitiativeInsight(state.sessions),
+      stickiness: buildStickinessInsight(sessionMetrics.quickReplyCount, sessionMetrics.turnSwitchCount, sessionMetrics.quickReplyThreshold),
+      restartFrequency: buildRestartFrequencyInsight(sessionMetrics.restartCount, spanDays, sessionMetrics.threshold),
+      replyAsymmetry: conversationMode === "direct"
+        ? buildReplyAsymmetryInsightFromMetrics(sessionMetrics.directionalReplies)
+        : buildGroupReplyInsight(sessionMetrics.directionalReplies, conversationMode),
+      initiative: conversationMode === "group"
+        ? buildGroupInitiativeInsight(sessionMetrics.restartInitiators)
+        : buildInitiativeInsight(state.sessions),
     },
     timeline: monthlyEntries,
     dailyTimeline: dailyEntries
@@ -559,11 +821,12 @@ function buildPayload(state) {
     replyHistogram: {
       bins: REPLY_BUCKET_LABELS.map((label, index) => ({
         label,
-        count: state.replyBuckets[index],
+        count: sessionMetrics.replyBuckets[index],
       })),
-      longestGapLabel: state.longestGap ? formatDuration(state.longestGap.duration) : "暫無",
-      longestGapRange: state.longestGap
-        ? `${formatShortDate(state.longestGap.from)} → ${formatShortDate(state.longestGap.to)}`
+      precision: sessionMetrics.precision.replyMedian,
+      longestGapLabel: sessionMetrics.longestSilence ? formatDuration(sessionMetrics.longestSilence.duration) : "暫無",
+      longestGapRange: sessionMetrics.longestSilence
+        ? `${formatShortDate(sessionMetrics.longestSilence.from)} → ${formatShortDate(sessionMetrics.longestSilence.to)}`
         : "目前資料還不夠",
     },
     topDays: dailyEntries
@@ -576,15 +839,126 @@ function buildPayload(state) {
     catchphrases: buildCatchphrasePayload(state.catchphraseStats, state.totalMessages),
     messageMix: buildMessageMixPayload(participants.slice(0, LANGUAGE_PARTICIPANT_LIMIT), state.participants),
     calls: buildCallsPayload(state.calls),
-    people: participants.slice(0, PEOPLE_LIMIT),
+    people: participants,
     participantDisplay: {
       total: participantCount,
       timelineLimit: TIMELINE_PARTICIPANT_LIMIT,
-      peopleLimit: PEOPLE_LIMIT,
       timelineHasOther: participantCount > timelineParticipants.length,
     },
     topReactions: buildReactionPayload(state.reactionTypes, 10),
   };
+}
+
+function getConversationMode(participantCount) {
+  if (participantCount <= 1) {
+    return "single";
+  }
+  if (participantCount === 2) {
+    return "direct";
+  }
+  return "group";
+}
+
+function buildTrendViewsByTopN(state, participants) {
+  const output = {};
+  for (const limit of TIMELINE_TOP_N_OPTIONS) {
+    const selectedNames = participants.slice(0, limit).map((participant) => participant.name);
+    const namesWithOther =
+      participants.length > selectedNames.length ? [...selectedNames, "其他"] : selectedNames;
+    output[String(limit)] = {
+      participants: namesWithOther,
+      timeline: [...state.monthly.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([month, entry]) => ({
+          label: month,
+          total: entry.total,
+          byParticipant: buildGroupedParticipantCounts(entry, selectedNames),
+        })),
+      dailyTimeline: [...state.daily.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([date, entry]) => ({
+          label: date,
+          total: entry.total,
+          byParticipant: buildGroupedParticipantCounts(entry, selectedNames),
+        })),
+    };
+  }
+  return output;
+}
+
+function buildGroupMetrics(participants, sessionMetrics) {
+  const counts = participants.map((participant) => participant.messages).filter((count) => count > 0);
+  const totalMessages = counts.reduce((sum, count) => sum + count, 0);
+  const topParticipantShare = totalMessages ? counts[0] / totalMessages : 0;
+  const topThreeShare = totalMessages
+    ? counts.slice(0, 3).reduce((sum, count) => sum + count, 0) / totalMessages
+    : 0;
+  const medianMessagesPerParticipant = quantile(counts, 0.5) || 0;
+  return {
+    activeParticipantCount: counts.length,
+    topParticipantShare,
+    topParticipantShareLabel: `${(topParticipantShare * 100).toFixed(1)}%`,
+    topThreeShare,
+    topThreeShareLabel: `${(topThreeShare * 100).toFixed(1)}%`,
+    medianMessagesPerParticipant,
+    starterRanking: sessionMetrics.restartInitiators,
+    concentrationLevel: getConcentrationLevel(topThreeShare),
+    concentrationLabel: getConcentrationLabel(topThreeShare),
+  };
+}
+
+function getConcentrationLevel(topThreeShare) {
+  if (topThreeShare < GROUP_CONCENTRATION_THRESHOLDS.low) {
+    return "low";
+  }
+  if (topThreeShare < GROUP_CONCENTRATION_THRESHOLDS.high) {
+    return "medium";
+  }
+  return "high";
+}
+
+function getConcentrationLabel(topThreeShare) {
+  const level = getConcentrationLevel(topThreeShare);
+  if (level === "low") {
+    return "低集中：多人平均參與";
+  }
+  if (level === "medium") {
+    return "中集中：部分成員較活躍";
+  }
+  return "高集中：主要由少數成員主導";
+}
+
+function buildGroupBalanceSummary(groupMetrics) {
+  return {
+    label: groupMetrics.topThreeShareLabel,
+    meta: `${groupMetrics.concentrationLabel}，前三位訊息占比 ${groupMetrics.topThreeShareLabel}`,
+  };
+}
+
+function serializeSessionMetrics(metricsByThreshold) {
+  const output = {};
+  for (const [threshold, metrics] of Object.entries(metricsByThreshold)) {
+    output[threshold] = {
+      threshold: metrics.threshold,
+      thresholdLabel: metrics.thresholdLabel,
+      quickReplyThreshold: metrics.quickReplyThreshold,
+      quickReplyThresholdLabel: metrics.quickReplyThresholdLabel,
+      sessionCount: metrics.sessionCount,
+      sessionMedian: metrics.sessionMedian,
+      restartCount: metrics.restartCount,
+      restartMedian: metrics.restartMedian,
+      restartInitiators: metrics.restartInitiators,
+      longestSilence: metrics.longestSilence,
+      turnSwitchCount: metrics.turnSwitchCount,
+      quickReplyCount: metrics.quickReplyCount,
+      replyBuckets: metrics.replyBuckets,
+      replyMedian: metrics.replyMedian,
+      replyP90: metrics.replyP90,
+      directionalReplies: metrics.directionalReplies.slice(0, REPLY_ASYMMETRY_PARTICIPANT_LIMIT),
+      precision: metrics.precision,
+    };
+  }
+  return output;
 }
 
 function buildActiveHoursInsight(heatmap) {
@@ -728,6 +1102,82 @@ function buildReplyAsymmetryInsight(sequenceSenders, sequenceTimestamps, replyTh
   };
 }
 
+function buildReplyAsymmetryInsightFromMetrics(directionalReplies) {
+  const directional = directionalReplies.slice(0, 2);
+  if (!directional.length) {
+    return {
+      label: "暫無",
+      meta: "目前還沒有足夠的雙向回覆資料",
+      rows: [],
+    };
+  }
+
+  if (directional.length === 1) {
+    return {
+      label: formatMetricDuration(directional[0].median),
+      meta: `${directional[0].key} 這個方向在同一段對話內的常見回覆速度`,
+      rows: [
+        {
+          label: formatReplyDirectionLabel(directional[0].key),
+          value: formatMetricDuration(directional[0].median),
+        },
+      ],
+    };
+  }
+
+  const difference = Math.abs(directional[0].median - directional[1].median);
+  return {
+    label: `相差 ${formatMetricDuration(difference)}`,
+    meta: "只比較同一段對話內的接話，不含超過對話斷點的沉默重啟",
+    rows: directional.map((entry) => ({
+      label: formatReplyDirectionLabel(entry.key),
+      value: formatMetricDuration(entry.median),
+    })),
+  };
+}
+
+function buildGroupReplyInsight(directionalReplies, conversationMode) {
+  if (conversationMode === "single") {
+    return {
+      label: "不適用",
+      meta: "單人或特殊對話沒有雙向回覆比較。",
+      rows: [],
+    };
+  }
+
+  const top = directionalReplies[0];
+  return {
+    label: top ? formatMetricDuration(top.median) : "暫無",
+    meta: top
+      ? `群組模式僅顯示最常見的接話方向作為節奏線索：${formatReplyDirectionLabel(top.key)}`
+      : "群組模式不使用一對一雙向比較，目前也沒有足夠的接話資料。",
+    rows: directionalReplies.slice(0, 3).map((entry) => ({
+      label: formatReplyDirectionLabel(entry.key),
+      value: `${formatMetricDuration(entry.median)} / ${entry.count.toLocaleString()} 次`,
+    })),
+  };
+}
+
+function buildGroupInitiativeInsight(starterRanking) {
+  if (!starterRanking.length) {
+    return {
+      label: "暫無",
+      meta: "目前還沒有足夠的對話重啟資料。",
+      rows: [],
+    };
+  }
+
+  const top = starterRanking[0];
+  return {
+    label: top.name,
+    meta: `群組重啟排行：${top.name} 發起 ${top.count.toLocaleString()} 次（${top.share}%）`,
+    rows: starterRanking.slice(0, 3).map((entry) => ({
+      label: entry.name,
+      value: `${entry.count.toLocaleString()} 次（${entry.share}%）`,
+    })),
+  };
+}
+
 function formatReplyDirectionLabel(directionKey) {
   const [from, to] = directionKey.split("→");
   if (!from || !to) {
@@ -798,7 +1248,7 @@ function buildSessions(sequenceSenders, sequenceTimestamps, threshold) {
 
   for (let i = 1; i < sequenceSenders.length; i += 1) {
     const gap = sequenceTimestamps[i] - sequenceTimestamps[i - 1];
-    if (gap >= threshold) {
+    if (gap > threshold) {
       sessions.push(current);
       current = {
         initiator: sequenceSenders[i],
@@ -814,6 +1264,220 @@ function buildSessions(sequenceSenders, sequenceTimestamps, threshold) {
 
   sessions.push(current);
   return sessions;
+}
+
+function buildSessionMetricsByThreshold(sequenceSenders, sequenceTimestamps) {
+  const output = {};
+  for (const threshold of SESSION_THRESHOLDS_MS) {
+    output[String(threshold)] = buildSessionMetrics(sequenceSenders, sequenceTimestamps, threshold);
+  }
+  return output;
+}
+
+function buildSessionMetrics(sequenceSenders, sequenceTimestamps, threshold) {
+  const sessions = buildSessions(sequenceSenders, sequenceTimestamps, threshold);
+  const replyBuckets = Array(REPLY_BUCKET_LABELS.length).fill(0);
+  const replyQuantiles = createQuantileAccumulator();
+  const restartQuantiles = createQuantileAccumulator();
+  const sessionDurationQuantiles = createQuantileAccumulator();
+  const restartInitiators = new Map();
+  const directional = new Map();
+  let turnSwitchCount = 0;
+  let quickReplyCount = 0;
+  let restartCount = 0;
+  let longestSilence = null;
+
+  for (const session of sessions) {
+    const duration = Math.max(0, session.end - session.start);
+    addQuantileValue(sessionDurationQuantiles, duration);
+  }
+
+  for (let index = 1; index < sequenceSenders.length; index += 1) {
+    const previousSender = sequenceSenders[index - 1];
+    const sender = sequenceSenders[index];
+    const gap = sequenceTimestamps[index] - sequenceTimestamps[index - 1];
+    if (gap < 0) {
+      continue;
+    }
+
+    if (gap > threshold) {
+      restartCount += 1;
+      addQuantileValue(restartQuantiles, gap);
+      restartInitiators.set(sender, (restartInitiators.get(sender) || 0) + 1);
+      if (!longestSilence || gap > longestSilence.duration) {
+        longestSilence = {
+          duration: gap,
+          from: sequenceTimestamps[index - 1],
+          to: sequenceTimestamps[index],
+          initiator: sender,
+        };
+      }
+      continue;
+    }
+
+    if (previousSender !== sender) {
+      turnSwitchCount += 1;
+      if (gap <= QUICK_REPLY_MAX_MS) {
+        quickReplyCount += 1;
+      }
+      addReplyDelayToBuckets(replyBuckets, gap);
+      addQuantileValue(replyQuantiles, gap);
+
+      const key = `${previousSender}→${sender}`;
+      if (!directional.has(key)) {
+        directional.set(key, {
+          count: 0,
+          quantiles: createQuantileAccumulator(),
+        });
+      }
+      const pair = directional.get(key);
+      pair.count += 1;
+      addQuantileValue(pair.quantiles, gap);
+    }
+  }
+
+  const replyMedian = getQuantileValue(replyQuantiles, 0.5);
+  const replyP90 = getQuantileValue(replyQuantiles, 0.9);
+  const restartMedian = getQuantileValue(restartQuantiles, 0.5);
+  const sessionMedian = getQuantileValue(sessionDurationQuantiles, 0.5);
+
+  return {
+    threshold,
+    thresholdLabel: formatThresholdLabel(threshold),
+    quickReplyThreshold: Math.min(threshold, QUICK_REPLY_MAX_MS),
+    quickReplyThresholdLabel: formatThresholdLabel(Math.min(threshold, QUICK_REPLY_MAX_MS)),
+    sessions,
+    sessionCount: sessions.length,
+    sessionMedian,
+    restartCount,
+    restartIntervals: getQuantileSamplesForCompat(restartQuantiles),
+    restartMedian,
+    restartInitiators: buildRankedCounts(restartInitiators, restartCount, 12),
+    longestSilence,
+    turnSwitchCount,
+    quickReplyCount,
+    replyBuckets,
+    replySamples: getQuantileSamplesForCompat(replyQuantiles),
+    replyMedian,
+    replyP90,
+    directionalReplies: buildDirectionalReplyRows(directional),
+    precision: {
+      replyMedian: replyQuantiles.mode,
+      restartMedian: restartQuantiles.mode,
+      sessionMedian: sessionDurationQuantiles.mode,
+      exactQuantileLimit: EXACT_QUANTILE_LIMIT,
+    },
+  };
+}
+
+function createQuantileAccumulator() {
+  return {
+    count: 0,
+    values: [],
+    histogram: Array(QUANTILE_HISTOGRAM_BOUNDS.length + 1).fill(0),
+    mode: "exact",
+  };
+}
+
+const QUANTILE_HISTOGRAM_BOUNDS = [
+  1_000,
+  2_000,
+  5_000,
+  10_000,
+  20_000,
+  30_000,
+  60_000,
+  2 * 60_000,
+  5 * 60_000,
+  10 * 60_000,
+  30 * 60_000,
+  60 * 60_000,
+  2 * 60 * 60_000,
+  6 * 60 * 60_000,
+  12 * 60 * 60_000,
+  24 * 60 * 60_000,
+  3 * 24 * 60 * 60_000,
+  7 * 24 * 60 * 60_000,
+  30 * 24 * 60 * 60_000,
+];
+
+function addQuantileValue(stats, value) {
+  if (!Number.isFinite(value) || value < 0) {
+    return;
+  }
+
+  stats.count += 1;
+  if (stats.mode === "exact" && stats.values.length < EXACT_QUANTILE_LIMIT) {
+    stats.values.push(value);
+    return;
+  }
+
+  if (stats.mode === "exact") {
+    for (const existing of stats.values) {
+      addHistogramValue(stats.histogram, existing);
+    }
+    stats.values = [];
+    stats.mode = "approximate";
+  }
+  addHistogramValue(stats.histogram, value);
+}
+
+function addHistogramValue(histogram, value) {
+  const index = QUANTILE_HISTOGRAM_BOUNDS.findIndex((bound) => value <= bound);
+  histogram[index === -1 ? histogram.length - 1 : index] += 1;
+}
+
+function getQuantileValue(stats, ratio) {
+  if (!stats.count) {
+    return null;
+  }
+
+  if (stats.mode === "exact") {
+    return quantile(stats.values, ratio);
+  }
+
+  const target = Math.max(1, Math.ceil(stats.count * ratio));
+  let cumulative = 0;
+  for (let index = 0; index < stats.histogram.length; index += 1) {
+    cumulative += stats.histogram[index];
+    if (cumulative >= target) {
+      return QUANTILE_HISTOGRAM_BOUNDS[index] || QUANTILE_HISTOGRAM_BOUNDS[QUANTILE_HISTOGRAM_BOUNDS.length - 1];
+    }
+  }
+  return QUANTILE_HISTOGRAM_BOUNDS[QUANTILE_HISTOGRAM_BOUNDS.length - 1];
+}
+
+function getQuantileSamplesForCompat(stats) {
+  return stats.mode === "exact" ? stats.values : [];
+}
+
+function addReplyDelayToBuckets(buckets, delay) {
+  const bucketIndex = REPLY_BUCKETS_MS.findIndex((limit) => delay < limit);
+  const safeIndex = bucketIndex === -1 ? buckets.length - 1 : bucketIndex;
+  buckets[safeIndex] += 1;
+}
+
+function buildRankedCounts(counts, total, limit) {
+  return [...counts.entries()]
+    .map(([name, count]) => ({
+      name,
+      count,
+      share: total ? ((count / total) * 100).toFixed(1) : "0.0",
+    }))
+    .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name))
+    .slice(0, limit);
+}
+
+function buildDirectionalReplyRows(directional) {
+  return [...directional.entries()]
+    .map(([key, stats]) => ({
+      key,
+      count: stats.count,
+      median: getQuantileValue(stats.quantiles, 0.5),
+      precision: stats.quantiles.mode,
+    }))
+    .filter((entry) => entry.median !== null)
+    .sort((left, right) => right.count - left.count || left.key.localeCompare(right.key));
 }
 
 function buildInitiativeInsight(sessions) {
@@ -863,11 +1527,17 @@ function isPhoneCallEvent(message) {
 }
 
 function processPhoneCall(message, state, sender, timestamp) {
+  const durationSeconds = extractCallDurationSeconds(message);
+  const hasDuration = durationSeconds !== null;
+  const outcome = getCallOutcomeLabel(message);
   state.calls.push({
     sender,
     timestamp,
-    durationSeconds: extractCallDurationSeconds(message),
-    outcome: getCallOutcomeLabel(message),
+    durationSeconds: hasDuration ? durationSeconds : 0,
+    hasDuration,
+    outcome,
+    hasResult: hasCallResult(message),
+    completeness: hasDuration && hasCallResult(message) ? "complete" : hasDuration || hasCallResult(message) ? "partial" : "minimal",
   });
 }
 
@@ -1045,23 +1715,25 @@ function addReplyDelay(state, delay) {
   state.replyBuckets[safeIndex] += 1;
 }
 
-function updateHeavyTerms(heavyTerms, text) {
-  const tokens = extractTermTokens(text);
+function updateHeavyTerms(state, text) {
+  const tokens = extractTermTokens(text, state.tokenizer, state.wordAnalysisMeta, {
+    excludeToneMarkers: true,
+  });
   for (const token of tokens) {
-    recordCount(heavyTerms, token);
+    recordCount(state.heavyTerms, token);
   }
 }
 
-function updateParticipantLanguage(catchphraseStats, sender, text, senderMessageCount) {
-  let person = catchphraseStats.get(sender);
+function updateParticipantLanguage(state, sender, text, senderMessageCount, dayKey) {
+  let person = state.catchphraseStats.get(sender);
   if (!person) {
     if (senderMessageCount < LANGUAGE_MIN_MESSAGES) {
       return;
     }
-    if (catchphraseStats.size >= LANGUAGE_PARTICIPANT_LIMIT) {
+    if (state.catchphraseStats.size >= LANGUAGE_PARTICIPANT_LIMIT) {
       let smallestName = null;
       let smallestMessages = Infinity;
-      for (const [name, stats] of catchphraseStats.entries()) {
+      for (const [name, stats] of state.catchphraseStats.entries()) {
         if (stats.messages < smallestMessages) {
           smallestName = name;
           smallestMessages = stats.messages;
@@ -1070,54 +1742,156 @@ function updateParticipantLanguage(catchphraseStats, sender, text, senderMessage
       if (senderMessageCount <= smallestMessages) {
         return;
       }
-      catchphraseStats.delete(smallestName);
+      state.catchphraseStats.delete(smallestName);
     }
     person = {
       words: new Map(),
       phrases: new Map(),
+      tone: new Map(),
       messages: senderMessageCount - 1,
     };
-    catchphraseStats.set(sender, person);
+    state.catchphraseStats.set(sender, person);
   }
 
   person.messages += 1;
 
-  for (const token of extractTermTokens(text)) {
+  for (const token of extractTermTokens(text, state.tokenizer, state.wordAnalysisMeta, {
+    excludeToneMarkers: false,
+  })) {
+    if (TONE_MARKERS.has(token)) {
+      recordCount(person.tone, token);
+      continue;
+    }
     recordCount(person.words, token);
   }
 
   for (const phrase of extractPhraseCandidates(text)) {
-    recordCount(person.phrases, phrase);
+    recordPhraseCandidate(person.phrases, phrase, dayKey);
   }
 }
 
-function extractTermTokens(text) {
+function createTokenizer(customDictionary) {
+  const hasSegmenter = typeof Intl !== "undefined" && typeof Intl.Segmenter === "function";
+  const segmenter = hasSegmenter ? new Intl.Segmenter("zh-Hant", { granularity: "word" }) : null;
+  return {
+    strategy: segmenter ? "intl-segmenter" : "fallback",
+    segmenter,
+    customDictionary,
+  };
+}
+
+function normalizeCustomDictionary(input) {
+  const raw = Array.isArray(input)
+    ? input
+    : typeof input === "string"
+      ? input.split(/\r?\n/u)
+      : [];
+  const seen = new Set();
+  const words = [];
+  for (const value of raw) {
+    const word = String(value || "").trim().replace(/\s+/gu, " ");
+    if (!word || word.length > 40 || seen.has(word)) {
+      continue;
+    }
+    seen.add(word);
+    words.push(word);
+    if (words.length >= 100) {
+      break;
+    }
+  }
+  return words;
+}
+
+function extractTermTokens(text, tokenizer = createTokenizer([]), meta = null, options = {}) {
+  const customDictionary = tokenizer.customDictionary || [];
   const normalized = text
     .toLowerCase()
     .replace(/https?:\/\/\S+/g, " ")
     .replace(/[_~!！?？,，.。:：;；、/|()[\]{}"'`<>#%^&*+=\\\n\r\t-]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  const tokens = normalized.match(/[a-z0-9_-]{2,}|[\p{Script=Han}]{2,}/gu) || [];
+  const tokens = tokenizer.segmenter
+    ? segmentWithIntl(normalized, tokenizer.segmenter)
+    : normalized.match(/[a-z0-9_-]{2,}|[\p{Script=Han}]{2,}/gu) || [];
   const output = [];
+  const customMatches = findCustomDictionaryMatches(text, customDictionary);
+  output.push(...customMatches);
+  for (const marker of TONE_MARKERS) {
+    if (text.toLowerCase().includes(marker.toLowerCase())) {
+      pushToken(marker, output, meta, options);
+    }
+  }
 
   for (const token of tokens) {
     if (/^[\p{Script=Han}]+$/u.test(token)) {
-      output.push(...extractHanTermCandidates(token));
+      for (const candidate of extractHanTermCandidates(token)) {
+        pushToken(candidate, output, meta, options);
+      }
       continue;
     }
 
-    if (!STOPWORDS.has(token)) {
-      output.push(token);
-    }
+    pushToken(token, output, meta, options);
   }
 
   return output;
 }
 
+function segmentWithIntl(text, segmenter) {
+  return [...segmenter.segment(text)]
+    .filter((segment) => segment.isWordLike)
+    .map((segment) => segment.segment.toLowerCase());
+}
+
+function pushToken(token, output, meta, options) {
+  const normalized = normalizeToken(token);
+  if (!normalized) {
+    if (meta) {
+      meta.rejectedTokenCount += 1;
+    }
+    return;
+  }
+  if (GENERAL_WORD_EXCLUSIONS.has(normalized)) {
+    if (meta) {
+      meta.rejectedTokenCount += 1;
+    }
+    return;
+  }
+  if (options.excludeToneMarkers && TONE_MARKERS.has(normalized)) {
+    if (meta) {
+      meta.rejectedTokenCount += 1;
+    }
+    return;
+  }
+  output.push(normalized);
+}
+
+function normalizeToken(token) {
+  const normalized = String(token || "")
+    .toLowerCase()
+    .trim()
+    .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+  if (normalized.length < 2 || /^[\d\s]+$/u.test(normalized)) {
+    return "";
+  }
+  return normalized;
+}
+
+function findCustomDictionaryMatches(text, customDictionary) {
+  if (!customDictionary.length) {
+    return [];
+  }
+  const lowerText = text.toLowerCase();
+  return customDictionary
+    .filter((term) => lowerText.includes(term.toLowerCase()))
+    .map((term) => term.trim())
+    .filter(Boolean);
+}
+
 function extractPhraseCandidates(text) {
   const normalized = text
     .replace(/https?:\/\/\S+/g, " ")
+    .replace(/\b\d{1,2}:\d{2}\b/g, " ")
+    .replace(/\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b/g, " ")
     .replace(/[~!！?？,，.。:：;；、/\n\r\t]+/g, "|")
     .replace(/\s+/g, " ")
     .trim();
@@ -1130,10 +1904,10 @@ function extractPhraseCandidates(text) {
   const phrases = [];
   for (const rawPart of normalized.split("|")) {
     const candidate = rawPart.trim().replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
-    if (!candidate || candidate.length < 2 || candidate.length > 12) {
+    if (!candidate || candidate.length < 4 || candidate.length > 24) {
       continue;
     }
-    if (/^\d+$/u.test(candidate) || PHRASE_STOPWORDS.has(candidate)) {
+    if (/^\d+$/u.test(candidate) || PHRASE_STOPWORDS.has(candidate) || /^[\d\s:：/-]+$/u.test(candidate)) {
       continue;
     }
     if (seen.has(candidate)) {
@@ -1143,6 +1917,23 @@ function extractPhraseCandidates(text) {
     phrases.push(candidate);
   }
   return phrases;
+}
+
+function recordPhraseCandidate(map, phrase, dayKey) {
+  let entry = map.get(phrase);
+  if (!entry) {
+    entry = {
+      totalCount: 0,
+      messageCount: 0,
+      days: new Set(),
+    };
+    map.set(phrase, entry);
+  }
+  entry.totalCount += 1;
+  entry.messageCount += 1;
+  if (dayKey) {
+    entry.days.add(dayKey);
+  }
 }
 
 function extractHanTermCandidates(chunk) {
@@ -1222,22 +2013,69 @@ function recordCount(map, key) {
 
 function buildCatchphrasePayload(catchphraseStats, totalMessages) {
   return [...catchphraseStats.entries()]
-    .map(([name, stats]) => ({
-      name,
-      messageShare: totalMessages ? ((stats.messages / totalMessages) * 100).toFixed(1) : "0.0",
-      topWords: [...stats.words.entries()]
-        .map(([term, count]) => ({ term, count }))
-        .sort((left, right) => right.count - left.count || left.term.localeCompare(right.term))
-        .slice(0, 8),
-      topPhrases: [...stats.phrases.entries()]
-        .filter(([, count]) => count >= 2)
-        .map(([term, count]) => ({ term, count }))
-        .sort((left, right) => right.count - left.count || left.term.localeCompare(right.term))
-        .slice(0, 6),
-      messages: stats.messages,
-    }))
+    .map(([name, stats]) => {
+      const phraseCandidates = suppressOverlappingPhrases(
+        [...stats.phrases.entries()]
+          .map(([term, entry]) => ({
+            term,
+            totalCount: entry.totalCount,
+            messageCount: entry.messageCount,
+            activeDayCount: entry.days.size,
+            score: scorePhraseCandidate(term, entry),
+          }))
+          .filter((entry) => (
+            entry.totalCount >= 3 &&
+            entry.messageCount >= 2 &&
+            entry.activeDayCount >= 2
+          ))
+          .sort((left, right) => right.score - left.score || right.totalCount - left.totalCount),
+      );
+
+      return {
+        name,
+        messageShare: totalMessages ? ((stats.messages / totalMessages) * 100).toFixed(1) : "0.0",
+        topWords: [...stats.words.entries()]
+          .map(([term, count]) => ({ term, count }))
+          .sort((left, right) => right.count - left.count || left.term.localeCompare(right.term))
+          .slice(0, 8),
+        toneMarkers: [...stats.tone.entries()]
+          .map(([term, count]) => ({ term, count }))
+          .sort((left, right) => right.count - left.count || left.term.localeCompare(right.term))
+          .slice(0, 5),
+        topPhrases: phraseCandidates.slice(0, 6),
+        messages: stats.messages,
+      };
+    })
     .sort((left, right) => right.messages - left.messages)
     .map(({ messages: _messages, ...person }) => person);
+}
+
+function scorePhraseCandidate(term, entry) {
+  /*
+   * Scores favor phrases that recur in several messages and days, while mildly
+   * preferring concise phrases. Overlap suppression runs after this, so longer
+   * variants must earn their place through broader recurrence.
+   */
+  const lengthScore = Math.min(term.length, 12) / 12;
+  return (
+    entry.messageCount * 3 +
+    entry.days.size * 2 +
+    entry.totalCount +
+    lengthScore
+  );
+}
+
+function suppressOverlappingPhrases(candidates) {
+  const selected = [];
+  for (const candidate of candidates) {
+    const overlaps = selected.some((existing) => (
+      existing.term.includes(candidate.term) || candidate.term.includes(existing.term)
+    ));
+    if (!overlaps) {
+      selected.push(candidate);
+    }
+  }
+  return selected;
 }
 
 function buildMessageMixPayload(participants, participantMap) {
@@ -1290,6 +2128,8 @@ function buildCallsPayload(calls) {
   const outcomes = new Map();
   let connected = 0;
   let totalDurationSeconds = 0;
+  let callsWithDuration = 0;
+  let callsWithResult = 0;
 
   for (const call of calls) {
     const date = new Date(call.timestamp);
@@ -1298,18 +2138,24 @@ function buildCallsPayload(calls) {
     const participant = byParticipant.get(call.sender) || { name: call.sender, count: 0, durationSeconds: 0 };
 
     participant.count += 1;
-    participant.durationSeconds += call.durationSeconds;
+    participant.durationSeconds += call.hasDuration ? call.durationSeconds : 0;
     byParticipant.set(call.sender, participant);
 
     const month = byMonth.get(monthKey) || { label: monthKey, count: 0, durationSeconds: 0 };
     month.count += 1;
-    month.durationSeconds += call.durationSeconds;
+    month.durationSeconds += call.hasDuration ? call.durationSeconds : 0;
     byMonth.set(monthKey, month);
 
     byHour[hour].count += 1;
-    outcomes.set(call.outcome, (outcomes.get(call.outcome) || 0) + 1);
+    if (call.hasResult) {
+      outcomes.set(call.outcome, (outcomes.get(call.outcome) || 0) + 1);
+      callsWithResult += 1;
+    }
 
-    if (call.durationSeconds > 0) {
+    if (call.hasDuration) {
+      callsWithDuration += 1;
+    }
+    if (call.hasDuration && call.durationSeconds > 0) {
       connected += 1;
       totalDurationSeconds += call.durationSeconds;
     }
@@ -1322,8 +2168,14 @@ function buildCallsPayload(calls) {
   return {
     total,
     connected,
+    callsWithDuration,
+    callsWithoutDuration: total - callsWithDuration,
+    durationCompletenessRate: total ? callsWithDuration / total : 0,
+    durationCompletenessLabel: `${(((callsWithDuration / total) || 0) * 100).toFixed(1)}%`,
+    callsWithResult,
+    callsWithoutResult: total - callsWithResult,
     totalDurationLabel: formatCallDuration(totalDurationSeconds),
-    avgDurationLabel: formatCallDuration(connected ? Math.round(totalDurationSeconds / connected) : 0),
+    avgDurationLabel: formatCallDuration(callsWithDuration ? Math.round(totalDurationSeconds / callsWithDuration) : 0),
     byParticipant: [...byParticipant.values()]
       .sort((left, right) => right.count - left.count)
       .map((entry) => ({
@@ -1369,14 +2221,17 @@ function buildCallsPayload(calls) {
 }
 
 function extractCallDurationSeconds(message) {
-  const duration = Number(message.duration_seconds ?? message.duration ?? 0);
-  return Number.isFinite(duration) && duration > 0 ? duration : 0;
+  if (!("duration_seconds" in message) && !("duration" in message)) {
+    return null;
+  }
+  const duration = Number(message.duration_seconds ?? message.duration);
+  return Number.isFinite(duration) && duration > 0 ? duration : null;
 }
 
 function getCallOutcomeLabel(message) {
   const reason = String(message.discard_reason || message.reason || "").toLowerCase();
   if (!reason) {
-    return extractCallDurationSeconds(message) > 0 ? "已接通" : "未知結果";
+    return extractCallDurationSeconds(message) !== null ? "已接通" : "未知結果";
   }
   if (reason.includes("miss")) {
     return "未接";
@@ -1394,6 +2249,10 @@ function getCallOutcomeLabel(message) {
     return "已取消";
   }
   return reason;
+}
+
+function hasCallResult(message) {
+  return Boolean(message.discard_reason || message.reason || extractCallDurationSeconds(message) !== null);
 }
 
 function formatCallDuration(totalSeconds) {

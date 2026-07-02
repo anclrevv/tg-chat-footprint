@@ -126,6 +126,19 @@
             </div>
 
             <p class="privacy-inline" id="privacy-copy">檔案只在本機瀏覽器處理，不會上傳、不會永久保存；重新整理後分析結果會消失。</p>
+            <div class="dictionary-panel" aria-labelledby="dictionary-title">
+              <div>
+                <p class="eyebrow">Local dictionary</p>
+                <h2 id="dictionary-title">自訂詞彙</h2>
+                <p>每行一個詞，只用於本機詞頻分析。</p>
+              </div>
+              <label class="sr-only" for="custom-dictionary">自訂詞彙，每行一個</label>
+              <textarea id="custom-dictionary" rows="4" maxlength="2000" placeholder="Traily&#10;Cloudflare Worker&#10;星宇航空"></textarea>
+              <div class="dictionary-actions">
+                <button class="button button-secondary" type="button" id="apply-dictionary">套用詞典</button>
+                <button class="button button-ghost" type="button" id="clear-dictionary">清除詞典</button>
+              </div>
+            </div>
           </div>
         </section>
 
@@ -151,8 +164,26 @@
               <p id="conversation-summary">已完成本機分析。</p>
             </div>
             <div class="dataset-actions">
+              <span class="mode-badge" id="conversation-mode-badge">—</span>
               <button class="button button-secondary" type="button" id="reselect-file">重新選擇檔案</button>
               <button class="button button-danger" type="button" id="clear-analysis">清除分析結果</button>
+            </div>
+            <div class="analysis-controls" aria-label="分析設定">
+              <label>
+                <span>對話斷點</span>
+                <select id="session-threshold-select"></select>
+              </label>
+              <label>
+                <span>圖表 Top N</span>
+                <select id="trend-topn-select">
+                  <option value="5">Top 5</option>
+                  <option value="8" selected>Top 8</option>
+                  <option value="12">Top 12</option>
+                  <option value="20">Top 20</option>
+                </select>
+              </label>
+              <span class="precision-badge" id="precision-badge">精確</span>
+              <span class="precision-badge muted" id="tokenizer-badge">斷詞</span>
             </div>
           </section>
 
