@@ -6,7 +6,7 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "check": "wrangler deploy --dry-run",
-    "test": "node tests/date-logic.test.js && node tests/app-render-contract.test.js",
+    "test": "node tests/date-logic.test.js && node tests/app-render-contract.test.js && node tests/worker-multifile.test.js",
     "verify": "npm run test && npm run check"
   },
   "devDependencies": {

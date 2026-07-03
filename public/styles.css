@@ -505,6 +505,72 @@ a {
   background: #dbe7ef;
 }
 
+.selected-files {
+  display: grid;
+  gap: 10px;
+  margin: 12px 0;
+  font-size: 0.9rem;
+}
+
+.selected-files-head,
+.selected-file-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.selected-files-head span,
+.selected-file-item span,
+.selected-files-merge {
+  color: var(--color-text-muted);
+}
+
+.selected-file-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.selected-file-item {
+  padding: 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: #fff;
+}
+
+.selected-file-item div {
+  min-width: 0;
+}
+
+.selected-file-item strong,
+.selected-file-item span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.file-list-action {
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-surface);
+  color: var(--color-text);
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.file-list-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.selected-files-merge {
+  margin: 0;
+}
+
 .progress-fill {
   width: 0%;
   height: 100%;

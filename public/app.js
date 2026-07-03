@@ -8,6 +8,7 @@ const progressText = document.querySelector("#progress-text");
 const fileMeta = document.querySelector("#file-meta");
 const fileName = document.querySelector("#file-name");
 const fileSize = document.querySelector("#file-size");
+const selectedFilesPanel = document.querySelector("#selected-files");
 const conversationSummary = document.querySelector("#conversation-summary");
 const clearAnalysisButton = document.querySelector("#clear-analysis");
 const reselectFileButton = document.querySelector("#reselect-file");
@@ -48,7 +49,7 @@ const guideOpenButtons = [document.querySelector("#guide-open"), document.queryS
 const guideCloseButton = document.querySelector("#guide-close");
 const guideJump = document.querySelector("#guide-jump");
 
-let currentFile = null;
+let currentFiles = [];
 let dailyTimelineState = null;
 let analysisWorker = null;
 let isAnalyzing = false;
@@ -68,6 +69,8 @@ const PARTICIPANT_COLORS = ["#14b8a6", "#3b82f6", "#8b5cf6", "#f59e0b", "#22c55e
 const VALID_CONVERSATION_MODES = new Set(["direct", "group", "single"]);
 const DEFAULT_SESSION_THRESHOLD_KEY = "1800000";
 const DEFAULT_SESSION_THRESHOLD_VALUE = Number(DEFAULT_SESSION_THRESHOLD_KEY);
+const MAX_FILE_COUNT = 20;
+const LARGE_TOTAL_SIZE_WARNING_BYTES = 250 * 1024 * 1024;
 
 customDictionaryInput.value = loadCustomDictionary();
 
@@ -81,9 +84,9 @@ replyInfoButton.addEventListener("click", () => {
 });
 
 fileInput.addEventListener("change", (event) => {
-  const [file] = event.target.files;
-  if (file) {
-    handleFile(file);
+  const files = [...(event.target.files || [])];
+  if (files.length) {
+    handleFiles(files);
   }
 });
 
@@ -105,10 +108,10 @@ dropzone.addEventListener("keydown", (event) => {
   dropzone.addEventListener(eventName, (event) => {
     event.preventDefault();
     if (eventName === "drop") {
-      const [file] = event.dataTransfer?.files || [];
-      if (file) {
+      const files = [...(event.dataTransfer?.files || [])];
+      if (files.length) {
         fileInput.files = event.dataTransfer.files;
-        handleFile(file);
+        handleFiles(files);
       }
     }
     dropzone.classList.remove("dragover");
@@ -134,16 +137,16 @@ applyDictionaryButton.addEventListener("click", () => {
   const dictionary = normalizeDictionaryText(customDictionaryInput.value).join("\n");
   customDictionaryInput.value = dictionary;
   saveCustomDictionary(dictionary);
-  if (currentFile && !isAnalyzing) {
-    handleFile(currentFile);
+  if (currentFiles.length && !isAnalyzing) {
+    handleFiles(currentFiles);
   }
 });
 
 clearDictionaryButton.addEventListener("click", () => {
   customDictionaryInput.value = "";
   saveCustomDictionary("");
-  if (currentFile && !isAnalyzing) {
-    handleFile(currentFile);
+  if (currentFiles.length && !isAnalyzing) {
+    handleFiles(currentFiles);
   }
 });
 
@@ -160,8 +163,12 @@ function handleWorkerMessage({ data }) {
   if (data.type === "progress") {
     statusText.textContent = data.label;
     setProgress(data.progress);
-    if (currentFile) {
-      fileMeta.textContent = `已處理 ${data.processedMessages.toLocaleString()} 則訊息`;
+    if (currentFiles.length) {
+      const filePrefix = data.totalFiles > 1
+        ? `第 ${data.currentFileIndex.toLocaleString()} / ${data.totalFiles.toLocaleString()} 個檔案`
+        : "目前檔案";
+      fileMeta.textContent = `${filePrefix}：已處理 ${data.processedMessages.toLocaleString()} 則訊息`;
+      updateSelectedFileStatus(data.currentFileIndex - 1, "analyzing");
     }
     return;
   }
@@ -191,7 +198,8 @@ function completeAnalysis(payload) {
     setProgress(100);
     statusText.classList.remove("status-error");
     statusText.textContent = "分析完成，可以開始看內容了";
-    fileMeta.textContent = "分析完成，結果已更新。";
+    fileMeta.textContent = buildMergeSummaryText(validation.normalized.mergeMeta) || "分析完成，結果已更新。";
+    renderSelectedFiles(currentFiles, validation.normalized.mergeMeta);
     analysisLive.textContent = "分析完成，結果已更新。";
     scrollDashboardIntoView();
   } catch (error) {
@@ -200,37 +208,85 @@ function completeAnalysis(payload) {
   }
 }
 
-function handleFile(file) {
+function handleFiles(files) {
   if (isAnalyzing) {
     return;
   }
 
-  if (!isLikelyJsonFile(file)) {
-    showError("請選擇 Telegram 匯出的 JSON 檔案，通常檔名是 result.json。");
+  const nextFiles = normalizeSelectedFiles(files);
+  if (!nextFiles.length) {
+    return;
+  }
+
+  if (nextFiles.length > MAX_FILE_COUNT) {
+    showError(`一次最多選擇 ${MAX_FILE_COUNT} 個 JSON 檔案。請移除部分檔案後重試。`);
+    return;
+  }
+
+  currentFiles = nextFiles;
+  const invalidFiles = nextFiles.filter((file) => !isLikelyJsonFile(file));
+  if (invalidFiles.length) {
+    renderSelectedFiles(nextFiles);
+    fileName.textContent = nextFiles.length === 1 ? nextFiles[0].name : `${nextFiles.length.toLocaleString()} 個檔案`;
+    fileSize.textContent = formatBytes(sumFileSizes(nextFiles));
+    showError("有檔案不是 JSON 格式。請移除標示為非 JSON 的檔案後重試。");
     return;
   }
 
   terminateWorker();
   analysisWorker = createAnalysisWorker();
   isAnalyzing = true;
-  currentFile = file;
   clearRenderedResults();
   hideResults();
   statusText.classList.remove("status-error");
   setInputDisabled(true);
   setProgress(0);
-  statusText.textContent = "已收到檔案，開始整理中";
-  fileName.textContent = file.name;
-  fileSize.textContent = formatBytes(file.size);
-  fileMeta.textContent = "背景分析中，請保持此頁開啟。";
+  statusText.textContent = buildSelectedFilesStatus(nextFiles);
+  fileName.textContent = nextFiles.length === 1 ? nextFiles[0].name : `${nextFiles.length.toLocaleString()} 個檔案`;
+  fileSize.textContent = formatBytes(sumFileSizes(nextFiles));
+  fileMeta.textContent = buildSizeWarning(nextFiles) || "背景分析中，請保持此頁開啟。";
+  renderSelectedFiles(nextFiles);
   analysisLive.textContent = "已開始分析檔案。";
   analysisWorker.postMessage({
     type: "analyze",
-    file,
+    files: nextFiles,
     options: {
       customDictionary: normalizeDictionaryText(customDictionaryInput.value),
     },
   });
+}
+
+function normalizeSelectedFiles(files) {
+  return [...files].filter(Boolean);
+}
+
+function buildSelectedFilesStatus(files) {
+  if (files.length === 1) {
+    return "已選擇 1 個檔案";
+  }
+  return `已選擇 ${files.length.toLocaleString()} 個檔案，將確認是否屬於同一個對話後合併分析。`;
+}
+
+function sumFileSizes(files) {
+  return files.reduce((sum, file) => sum + (file.size || 0), 0);
+}
+
+function buildSizeWarning(files) {
+  const totalSize = sumFileSizes(files);
+  if (totalSize <= LARGE_TOTAL_SIZE_WARNING_BYTES) {
+    return "";
+  }
+  return `總大小 ${formatBytes(totalSize)}，大型檔案可能需要較長時間，請保持此頁開啟。`;
+}
+
+function buildMergeSummaryText(mergeMeta) {
+  if (!mergeMeta || !mergeMeta.fileCount) {
+    return "";
+  }
+  if (mergeMeta.fileCount === 1) {
+    return `已分析 1 個檔案，實際分析 ${mergeMeta.uniqueMessageCount.toLocaleString()} 則訊息。`;
+  }
+  return `已合併 ${mergeMeta.fileCount.toLocaleString()} 個檔案，移除 ${mergeMeta.duplicateMessageCount.toLocaleString()} 則重複訊息，實際分析 ${mergeMeta.uniqueMessageCount.toLocaleString()} 則訊息。`;
 }
 
 function validateAnalysisResult(result) {
@@ -316,6 +372,25 @@ function normalizeAnalysisResult(result) {
     people,
     participantDisplay: normalizeParticipantDisplay(source.participantDisplay, participantCount),
     topReactions: normalizeArray(source.topReactions),
+    mergeMeta: normalizeMergeMeta(source.mergeMeta),
+  };
+}
+
+function normalizeMergeMeta(meta) {
+  const source = isPlainObject(meta) ? meta : {};
+  return {
+    fileCount: toSafeNumber(source.fileCount, 0),
+    totalInputBytes: toSafeNumber(source.totalInputBytes, 0),
+    rawMessageCount: toSafeNumber(source.rawMessageCount, 0),
+    duplicateMessageCount: toSafeNumber(source.duplicateMessageCount, 0),
+    uniqueMessageCount: toSafeNumber(source.uniqueMessageCount, 0),
+    chatIdentityConfidence: source.chatIdentityConfidence === "inferred" ? "inferred" : "exact",
+    sourceFiles: normalizeArray(source.sourceFiles).map((file) => ({
+      name: String(file?.name || ""),
+      size: toSafeNumber(file?.size, 0),
+      rawMessageCount: toSafeNumber(file?.rawMessageCount, 0),
+      duplicateMessageCount: toSafeNumber(file?.duplicateMessageCount, 0),
+    })),
   };
 }
 
@@ -673,7 +748,9 @@ function renderDatasetStrip(payload) {
   const { summary } = payload;
   const firstDate = getFirstTimelineDate(payload);
   const lastDate = getLastTimelineDate(payload);
-  const fileLabel = currentFile ? currentFile.name : "Telegram 對話";
+  const fileLabel = payload.mergeMeta?.fileCount > 1
+    ? `${payload.mergeMeta.fileCount.toLocaleString()} 個 JSON 檔案`
+    : currentFiles[0]?.name || "Telegram 對話";
   conversationSummary.textContent = `${fileLabel} • ${getConversationModeLabel(payload.conversationMode)} • ${summary.totalMessages.toLocaleString()} 則訊息 • ${summary.participantCount.toLocaleString()} 位參與者 • ${firstDate} 到 ${lastDate}`;
 }
 
@@ -969,7 +1046,7 @@ function clearRenderedResults() {
 
 function clearAnalysis() {
   terminateWorker();
-  currentFile = null;
+  currentFiles = [];
   fileInput.value = "";
   clearRenderedResults();
   resetUiState();
@@ -985,6 +1062,7 @@ function resetUiState() {
   fileName.textContent = "尚未選擇檔案";
   fileSize.textContent = "—";
   fileMeta.textContent = "";
+  renderSelectedFiles([]);
   conversationSummary.textContent = "已完成本機分析。";
   setProgress(0);
 }
@@ -1032,7 +1110,111 @@ function showError(message) {
   statusText.textContent = message;
   statusText.classList.add("status-error");
   fileMeta.textContent = "請清除後重新匯入，或確認檔案是否為 Telegram Desktop 匯出的 result.json。";
+  renderSelectedFiles(currentFiles);
   analysisLive.textContent = `分析失敗：${message}`;
+}
+
+function renderSelectedFiles(files, mergeMeta = null) {
+  selectedFilesPanel.innerHTML = "";
+  selectedFilesPanel.classList.toggle("hidden", files.length === 0);
+  if (!files.length) {
+    return;
+  }
+
+  const totalSize = sumFileSizes(files);
+  const header = document.createElement("div");
+  header.className = "selected-files-head";
+
+  const title = document.createElement("strong");
+  title.textContent = `${files.length.toLocaleString()} 個檔案`;
+  const meta = document.createElement("span");
+  meta.textContent = `總大小 ${formatBytes(totalSize)}`;
+  const clearButton = document.createElement("button");
+  clearButton.type = "button";
+  clearButton.className = "file-list-action";
+  clearButton.textContent = "清除全部";
+  clearButton.disabled = isAnalyzing;
+  clearButton.addEventListener("click", clearAnalysis);
+
+  header.append(title, meta, clearButton);
+  selectedFilesPanel.appendChild(header);
+
+  const list = document.createElement("ul");
+  list.className = "selected-file-list";
+  files.forEach((file, index) => {
+    const item = document.createElement("li");
+    item.className = "selected-file-item";
+    item.dataset.fileIndex = String(index);
+
+    const body = document.createElement("div");
+    const name = document.createElement("strong");
+    name.textContent = file.name;
+    const details = document.createElement("span");
+    const sourceMeta = mergeMeta?.sourceFiles?.[index] || null;
+    const validationLabel = getFileValidationLabel(file, sourceMeta);
+    details.textContent = `${formatBytes(file.size)} · ${validationLabel}`;
+    body.append(name, details);
+
+    const removeButton = document.createElement("button");
+    removeButton.type = "button";
+    removeButton.className = "file-list-action";
+    removeButton.textContent = "移除";
+    removeButton.disabled = isAnalyzing;
+    removeButton.addEventListener("click", () => removeSelectedFile(index));
+
+    item.append(body, removeButton);
+    list.appendChild(item);
+  });
+  selectedFilesPanel.appendChild(list);
+
+  if (mergeMeta?.fileCount) {
+    const mergeLine = document.createElement("p");
+    mergeLine.className = "selected-files-merge";
+    mergeLine.textContent = `合併後實際訊息數 ${mergeMeta.uniqueMessageCount.toLocaleString()}，移除重複 ${mergeMeta.duplicateMessageCount.toLocaleString()} 則`;
+    selectedFilesPanel.appendChild(mergeLine);
+  }
+}
+
+function getFileValidationLabel(file, sourceMeta = null) {
+  if (!isLikelyJsonFile(file)) {
+    return "非 JSON 檔案";
+  }
+  if (sourceMeta) {
+    return `已驗證，原始 ${sourceMeta.rawMessageCount.toLocaleString()} 則，重複 ${sourceMeta.duplicateMessageCount.toLocaleString()} 則`;
+  }
+  if (isAnalyzing) {
+    return "等待驗證";
+  }
+  return "可驗證";
+}
+
+function updateSelectedFileStatus(fileIndexToUpdate, status) {
+  if (!Number.isInteger(fileIndexToUpdate) || fileIndexToUpdate < 0) {
+    return;
+  }
+  for (const item of selectedFilesPanel.querySelectorAll(".selected-file-item")) {
+    if (Number(item.dataset.fileIndex) !== fileIndexToUpdate) {
+      continue;
+    }
+    const detail = item.querySelector("span");
+    const file = currentFiles[fileIndexToUpdate];
+    if (detail && file) {
+      detail.textContent = `${formatBytes(file.size)} · ${status === "analyzing" ? "正在驗證／分析" : "等待驗證"}`;
+    }
+  }
+}
+
+function removeSelectedFile(index) {
+  if (isAnalyzing || index < 0 || index >= currentFiles.length) {
+    return;
+  }
+  currentFiles = currentFiles.filter((_, fileIndex) => fileIndex !== index);
+  fileInput.value = "";
+  if (!currentFiles.length) {
+    clearAnalysis();
+    return;
+  }
+  handleFiles(currentFiles);
 }
 
 function logAnalysisRenderFailure(error, payload) {

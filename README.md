@@ -15,6 +15,7 @@ TG Chat Footprint is an independent open-source project and is not affiliated wi
 ## 功能特色
 
 - 匯入 Telegram Desktop 單一對話匯出的 `result.json`
+- 可選取同一聊天室分次匯出的多份 JSON 合併分析，並以 message id 去除重疊匯出的重複訊息
 - 使用瀏覽器 Web Worker 背景解析大型 JSON
 - 以串流方式掃描 `messages` 陣列，不一次把整份匯出檔載入記憶體
 - 聚合分析訊息趨勢、回覆節奏、活躍時段、參與者差異、詞頻、Reaction 與通話
@@ -49,6 +50,7 @@ TG Chat Footprint 基於 denny0223 的 Telegram Chat Lens 修改，並在保留�
 ## 隱私設計
 
 - 所有 Telegram JSON 解析都在使用者瀏覽器內完成
+- 多檔合併仍只在本機瀏覽器處理，不會上傳檔案
 - `public/worker.js` 是 Browser Web Worker，執行在使用者裝置中
 - `src/index.js` 是 Cloudflare Worker，只提供 Static Assets 與安全 headers
 - 不建立 upload API
@@ -61,7 +63,7 @@ TG Chat Footprint 基於 denny0223 的 Telegram Chat Lens 修改，並在保留�
 ## 使用方式
 
 1. 開啟正式網站或本機開發網站。
-2. 將 Telegram 匯出的 `result.json` 拖進匯入區，或點擊選擇檔案。
+2. 將 Telegram 匯出的 `result.json` 拖進匯入區，或點擊選擇檔案；同一聊天室的多份 JSON 可一起選取合併分析。
 3. 等待瀏覽器背景分析完成。
 4. 查看總覽、時間分析、對話節奏、訊息類型、詞頻、互動與通話分析。
 5. 可使用「清除分析結果」釋放目前分析狀態，再重新匯入其他檔案。
@@ -189,6 +191,9 @@ wrangler.jsonc
 分析實作：
 
 - 對話模式以實際有效 sender 數量判斷：0-1 人為單人／特殊對話、2 人為一對一、3 人以上為群組；Telegram 原始 chat type 只作輔助資訊。
+- 多檔分析只支援同一聊天室的多份 JSON。系統優先用 Telegram chat id 驗證；若缺 id，才以 name + type 推定同一對話。不同聊天室不會直接混合，也尚未提供不同聊天室比較模式。
+- 多份匯出可能有重疊時間範圍，分析前會先去重：優先使用 chat identity + message id；缺 message id 時使用時間、sender、訊息類型與正規化文字 hash 的保守 fallback。
+- 多檔合併後，reply、restart、session、starter ranking 與 directional reply 會以唯一訊息的全域時間順序重新計算，不會把每個檔案先聚合後相加。
 - 回覆速度只計算同一 session 內的說話者切換。超過所選 session threshold 的間隔會列入 restart interval，不再塞進 `>1d` 回覆桶。
 - 預設 session threshold 為 30 分鐘，並預先計算 10 分鐘、30 分鐘、1 小時與 6 小時四組聚合統計，因此切換門檻不需要重新上傳檔案。
 - 一般規模資料使用精確中位數；超過固定上限時，部分百分位數會使用固定記憶體 histogram 近似，介面會標示「精確」或「大型資料近似」。
@@ -201,6 +206,7 @@ wrangler.jsonc
 ## 已知限制
 
 - 目前支援 Telegram 匯出的對話 JSON；一對一與群組聊天會使用不同摘要方式，其他 Telegram 匯出結構可能需要重新選擇對話。
+- 多檔匯入目前限同一聊天室的多份 JSON，不支援將不同聊天室直接混合，也尚未提供不同聊天室比較 dashboard 或全帳號匯出 chat chooser。
 - 中文詞彙分析使用瀏覽器原生斷詞、停用詞與候選短語過濾，但專有名詞、高度口語化文字及無標點長句仍可能需要自訂詞典協助。
 - 大型群組圖表會以較活躍成員與「其他」呈現；完整參與者資料可透過搜尋與分頁查看，部分個人詞頻可能依資料規模限制預先計算。
 - 一般規模資料使用精確中位數；超大型資料的部分百分位數可能使用固定記憶體的串流近似演算法，介面會標示分析模式。

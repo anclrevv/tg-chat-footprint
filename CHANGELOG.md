@@ -17,6 +17,7 @@ All notable changes to this project will be documented in this file.
 - `Intl.Segmenter` word tokenization with fallback, tone marker categories, improved phrase scoring, and optional local custom dictionary
 - Participant table search, sorting, and pagination for large groups
 - Call completeness metrics for missing duration and result fields
+- Multi-file import for multiple Telegram JSON exports from the same chat, with chat identity validation and duplicate message removal
 
 ### Changed
 - Reorganized interface and information architecture
@@ -25,6 +26,7 @@ All notable changes to this project will be documented in this file.
 - Reply speed now only counts same-session speaker switches; long silences are reported as conversation restarts
 - Large group participant payload now returns aggregated rows for all participants, while personal language/type analysis remains capped and disclosed
 - Call average duration now excludes calls without duration instead of treating missing duration as zero seconds
+- Custom dictionary placeholder now uses more general examples
 
 ### Removed
 - Google Analytics

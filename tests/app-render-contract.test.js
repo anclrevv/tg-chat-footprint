@@ -71,6 +71,10 @@ class MockElement {
     return child;
   }
 
+  append(...children) {
+    this.children.push(...children);
+  }
+
   querySelector() {
     return new MockElement();
   }
@@ -105,6 +109,7 @@ function createContext() {
     "file-meta",
     "file-name",
     "file-size",
+    "selected-files",
     "conversation-summary",
     "clear-analysis",
     "reselect-file",

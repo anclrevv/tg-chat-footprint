@@ -206,6 +206,7 @@ const TIMELINE_PARTICIPANT_LIMIT = 8;
 const LANGUAGE_PARTICIPANT_LIMIT = 24;
 const LANGUAGE_MIN_MESSAGES = 5;
 const REPLY_ASYMMETRY_PARTICIPANT_LIMIT = 12;
+const MAX_FILE_COUNT = 20;
 const GROUP_CONCENTRATION_THRESHOLDS = {
   low: 0.4,
   high: 0.7,
@@ -217,7 +218,8 @@ self.addEventListener("message", async ({ data }) => {
   }
 
   try {
-    const payload = await analyzeFile(data.file, data.options || {});
+    const files = Array.isArray(data.files) ? data.files : data.file ? [data.file] : [];
+    const payload = await analyzeFiles(files, data.options || {});
     self.postMessage({ type: "result", payload });
   } catch (error) {
     self.postMessage({
@@ -227,15 +229,48 @@ self.addEventListener("message", async ({ data }) => {
   }
 });
 
+async function analyzeFiles(files, options = {}) {
+  if (!Array.isArray(files) || !files.length) {
+    throw new Error(buildValidationResult("EMPTY_FILE").message);
+  }
+  if (files.length > MAX_FILE_COUNT) {
+    throw new Error(`一次最多分析 ${MAX_FILE_COUNT} 個 JSON 檔案。`);
+  }
+
+  const state = createState(options);
+  state.mergeMeta.fileCount = files.length;
+  state.mergeMeta.totalInputBytes = files.reduce((sum, file) => sum + (file?.size || 0), 0);
+
+  for (let index = 0; index < files.length; index += 1) {
+    await analyzeFileIntoState(files[index], state, {
+      currentFileIndex: index + 1,
+      totalFiles: files.length,
+    });
+  }
+
+  finalizeState(state);
+  return buildPayload(state);
+}
+
 async function analyzeFile(file, options = {}) {
+  return analyzeFiles([file], options);
+}
+
+async function analyzeFileIntoState(file, state, progressMeta) {
   const validation = validateTelegramExportFile(file);
   if (!validation.valid) {
     throw new Error(validation.message);
   }
 
-  const state = createState(options);
   const reader = file.stream().getReader();
   const decoder = new TextDecoder();
+  const sourceFile = {
+    name: file.name || "result.json",
+    size: file.size || 0,
+    rawMessageCount: 0,
+    duplicateMessageCount: 0,
+  };
+  state.mergeMeta.sourceFiles.push(sourceFile);
   let bytesRead = 0;
   let preamble = "";
   let foundMessages = false;
@@ -262,13 +297,14 @@ async function analyzeFile(file, options = {}) {
         if (preamble.length > 200_000) {
           throw new Error(buildValidationResult("MESSAGES_MISSING", preamble).message);
         }
-        sendProgress(bytesRead, file.size, processedMessages, "正在確認聊天檔格式");
+        sendProgress(bytesRead, file.size, processedMessages, "正在確認聊天檔格式", file, progressMeta);
         continue;
       }
 
       const startIndex = match.index + match[0].length;
-      state.telegramChatType = extractRootStringField(preamble, "type") || "unknown";
-      state.chatName = extractRootStringField(preamble, "name") || extractRootStringField(preamble, "title") || "";
+      const headerText = preamble.slice(0, match.index);
+      const chatIdentity = normalizeChatIdentity(extractExportHeader(headerText));
+      validateAndSetChatIdentity(state, chatIdentity, sourceFile.name);
       text = preamble.slice(startIndex);
       preamble = "";
       foundMessages = true;
@@ -319,8 +355,10 @@ async function analyzeFile(file, options = {}) {
         depth -= 1;
         if (depth === 0) {
           processedMessages += 1;
+          sourceFile.rawMessageCount += 1;
+          state.mergeMeta.rawMessageCount += 1;
           try {
-            processMessageObject(JSON.parse(currentObject), state);
+            processMessageObjectWithDedupe(JSON.parse(currentObject), state, sourceFile);
           } catch (error) {
             if (error instanceof SyntaxError) {
               throw new Error(buildValidationResult("INVALID_JSON").message);
@@ -334,7 +372,7 @@ async function analyzeFile(file, options = {}) {
 
     const progress = (bytesRead / file.size) * 100;
     if (progress - lastProgressSent >= 1 || processedMessages < 10) {
-      sendProgress(bytesRead, file.size, processedMessages, "正在整理聊天內容，請稍候");
+      sendProgress(bytesRead, file.size, processedMessages, "正在整理聊天內容，請稍候", file, progressMeta);
       lastProgressSent = progress;
     }
   }
@@ -346,9 +384,6 @@ async function analyzeFile(file, options = {}) {
   if (depth !== 0 || currentObject) {
     throw new Error(buildValidationResult("TRUNCATED_JSON").message);
   }
-
-  finalizeState(state);
-  return buildPayload(state);
 }
 
 function validateTelegramExport(input) {
@@ -477,6 +512,78 @@ function extractRootStringField(preamble, key) {
   return match ? match[1] : "";
 }
 
+function extractRootValueField(preamble, key) {
+  const pattern = new RegExp(`"${key}"\\s*:\\s*("(?:[^"\\\\]|\\\\.)*"|-?\\d+(?:\\.\\d+)?)`);
+  const match = preamble.match(pattern);
+  if (!match) {
+    return null;
+  }
+  const raw = match[1];
+  if (raw.startsWith("\"")) {
+    try {
+      return JSON.parse(raw);
+    } catch (_error) {
+      return raw.slice(1, -1);
+    }
+  }
+  return raw;
+}
+
+function extractExportHeader(preamble) {
+  return {
+    id: extractRootValueField(preamble, "id"),
+    name: extractRootStringField(preamble, "name") || extractRootStringField(preamble, "title") || "",
+    type: extractRootStringField(preamble, "type") || "unknown",
+  };
+}
+
+function normalizeChatIdentity(exportData) {
+  const source = exportData && typeof exportData === "object" ? exportData : {};
+  const rawId = source.id ?? source.chat_id ?? null;
+  const id = rawId === null || rawId === undefined || rawId === "" ? null : String(rawId);
+  const name = String(source.name || source.title || "").trim();
+  const type = String(source.type || "").trim() || "unknown";
+  if (id !== null) {
+    return {
+      id,
+      name,
+      type,
+      key: `id:${id}`,
+      confidence: "exact",
+    };
+  }
+  return {
+    id: null,
+    name,
+    type,
+    key: `inferred:${name}\u0000${type}`,
+    confidence: "inferred",
+  };
+}
+
+function validateAndSetChatIdentity(state, identity, fileName) {
+  if (!state.chatIdentity) {
+    state.chatIdentity = identity;
+    state.chatName = identity.name;
+    state.telegramChatType = identity.type;
+    state.mergeMeta.chatIdentityConfidence = identity.confidence;
+    return;
+  }
+
+  if (state.chatIdentity.key === identity.key) {
+    if (state.chatIdentity.confidence === "inferred" || identity.confidence === "inferred") {
+      state.mergeMeta.chatIdentityConfidence = "inferred";
+    }
+    return;
+  }
+
+  const left = state.chatIdentity.name || state.chatIdentity.id || "未知對話";
+  const right = identity.name || identity.id || "未知對話";
+  throw new Error(
+    `偵測到所選檔案可能來自不同對話，目前無法合併分析。請移除不同聊天室的檔案後重試。不同檔案：${fileName}（${right}），目前對話：${left}。`,
+  );
+}
+
 function createState(options = {}) {
   const customDictionary = normalizeCustomDictionary(options.customDictionary);
   const tokenizer = createTokenizer(customDictionary);
@@ -514,16 +621,75 @@ function createState(options = {}) {
     sequenceSenders: [],
     sequenceTimestamps: [],
     calls: [],
-    lastMessage: null,
-    longestGap: null,
+    events: [],
     heavyTerms: new Map(),
     catchphraseStats: new Map(),
     reactionTypes: new Map(),
+    chatIdentity: null,
+    seenMessageKeys: new Set(),
+    mergeMeta: {
+      fileCount: 0,
+      totalInputBytes: 0,
+      rawMessageCount: 0,
+      duplicateMessageCount: 0,
+      uniqueMessageCount: 0,
+      chatIdentityConfidence: "exact",
+      sourceFiles: [],
+    },
   };
 }
 
+function processMessageObjectWithDedupe(message, state, sourceFile) {
+  const key = buildMessageDedupeKey(message, state.chatIdentity);
+  if (state.seenMessageKeys.has(key)) {
+    sourceFile.duplicateMessageCount += 1;
+    state.mergeMeta.duplicateMessageCount += 1;
+    return;
+  }
+  state.seenMessageKeys.add(key);
+  state.mergeMeta.uniqueMessageCount += 1;
+  processMessageObject(message, state);
+}
+
+function buildMessageDedupeKey(message, chatIdentity) {
+  const chatKey = chatIdentity?.key || "unknown-chat";
+  if (message && message.id !== undefined && message.id !== null && message.id !== "") {
+    return `${chatKey}::id:${String(message.id)}`;
+  }
+  const senderInfo = resolveSenderInfo(message || {});
+  const timestamp = parseTimestamp(message?.date);
+  const messageType = getDedupeMessageType(message || {});
+  const textHash = hashNormalizedText(extractText(message?.text));
+  return [
+    chatKey,
+    "fallback",
+    Number.isFinite(timestamp) ? String(timestamp) : "",
+    senderInfo.id || senderInfo.name,
+    messageType,
+    textHash,
+  ].join("::");
+}
+
+function getDedupeMessageType(message) {
+  if (isPhoneCallEvent(message)) {
+    return "phone_call";
+  }
+  return classifyMessageType(message, extractText(message.text).trim().length > 0);
+}
+
+function hashNormalizedText(text) {
+  const normalized = String(text || "").toLowerCase().replace(/\s+/gu, " ").trim();
+  let hash = 2_166_136_261;
+  for (let index = 0; index < normalized.length; index += 1) {
+    hash ^= normalized.charCodeAt(index);
+    hash = Math.imul(hash, 16_777_619);
+  }
+  return (hash >>> 0).toString(16);
+}
+
 function processMessageObject(message, state) {
-  const sender = resolveSender(message);
+  const senderInfo = resolveSenderInfo(message);
+  const sender = senderInfo.name;
   const timestamp = parseTimestamp(message.date);
   if (!Number.isFinite(timestamp)) {
     return;
@@ -617,40 +783,28 @@ function processMessageObject(message, state) {
     updateParticipantLanguage(state, sender, trimmedText, person.messages, dayKey);
   }
 
-  if (state.lastMessage) {
-    const gap = timestamp - state.lastMessage.timestamp;
-    if (gap >= 0) {
-      addQuantileSample(state.messageGapStats, gap);
-    }
-
-    if (state.lastMessage.sender !== sender) {
-      const delay = gap;
-      if (delay >= 0) {
-        addReplyDelay(state, delay);
-        addQuantileSample(state.turnDelayStats, delay);
-        state.turnSwitchCount += 1;
-      }
-    }
-
-    if (
-      gap >= 0 &&
-      (!state.longestGap || gap > state.longestGap.duration)
-    ) {
-      state.longestGap = {
-        duration: gap,
-        from: state.lastMessage.timestamp,
-        to: timestamp,
-      };
-    }
-  }
-
-  state.lastMessage = { sender, timestamp };
-  state.sequenceSenders.push(sender);
-  state.sequenceTimestamps.push(timestamp);
+  state.events.push({
+    id: message.id ?? null,
+    timestamp,
+    senderId: senderInfo.id,
+    senderName: sender,
+    messageType: classifyMessageType(message, hasText),
+    replyTarget: message.reply_to_message_id ?? null,
+  });
 }
 
 function resolveSender(message) {
-  const candidates = [
+  return resolveSenderInfo(message).name;
+}
+
+function resolveSenderInfo(message) {
+  const idCandidates = [
+    message.from_id,
+    message.actor_id,
+    message.user_id,
+    message.member_id,
+  ];
+  const nameCandidates = [
     message.from,
     message.actor,
     message.member_id,
@@ -659,16 +813,41 @@ function resolveSender(message) {
     message.user_id,
   ];
 
-  for (const candidate of candidates) {
-    if (typeof candidate === "string" && candidate.trim()) {
-      return candidate.trim();
+  let id = "";
+  for (const candidate of idCandidates) {
+    if ((typeof candidate === "string" || typeof candidate === "number") && String(candidate).trim()) {
+      id = String(candidate).trim();
+      break;
     }
   }
 
-  return "Unknown";
+  const candidates = [
+    ...nameCandidates,
+  ];
+
+  for (const candidate of candidates) {
+    if ((typeof candidate === "string" || typeof candidate === "number") && String(candidate).trim()) {
+      return {
+        id,
+        name: String(candidate).trim(),
+      };
+    }
+  }
+
+  return {
+    id,
+    name: "Unknown",
+  };
 }
 
 function finalizeState(state) {
+  const sortedEvents = [...state.events].sort((left, right) => (
+    left.timestamp - right.timestamp ||
+    String(left.id ?? "").localeCompare(String(right.id ?? "")) ||
+    left.senderName.localeCompare(right.senderName)
+  ));
+  state.sequenceSenders = sortedEvents.map((event) => event.senderName);
+  state.sequenceTimestamps = sortedEvents.map((event) => event.timestamp);
   state.sessionThreshold = DEFAULT_SESSION_THRESHOLD_MS;
   state.quickReplyThreshold = Math.min(state.sessionThreshold, QUICK_REPLY_MAX_MS);
   state.sessionMetricsByThreshold = buildSessionMetricsByThreshold(
@@ -846,6 +1025,7 @@ function buildPayload(state) {
       timelineHasOther: participantCount > timelineParticipants.length,
     },
     topReactions: buildReactionPayload(state.reactionTypes, 10),
+    mergeMeta: state.mergeMeta,
   };
 }
 
@@ -2387,10 +2567,17 @@ function formatHourRange(hour) {
   return `${String(hour).padStart(2, "0")}:00-${String((hour + 1) % 24).padStart(2, "0")}:00`;
 }
 
-function sendProgress(bytesRead, fileSize, processedMessages, label) {
+function sendProgress(bytesRead, fileSize, processedMessages, label, file = null, progressMeta = {}) {
+  const totalFiles = progressMeta.totalFiles || 1;
+  const currentFileIndex = progressMeta.currentFileIndex || 1;
+  const fileProgress = fileSize ? (bytesRead / fileSize) * 100 : 0;
+  const progress = ((currentFileIndex - 1) / totalFiles) * 100 + (fileProgress / totalFiles);
   self.postMessage({
     type: "progress",
-    progress: (bytesRead / fileSize) * 100,
+    currentFileIndex,
+    totalFiles,
+    currentFileName: file?.name || "",
+    progress,
     processedMessages,
     label,
   });
